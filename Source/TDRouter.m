@@ -36,7 +36,6 @@ static double TouchDBVersionNumber = 0.7;
 extern double TouchDBVersionNumber; // Defined in Xcode-generated TouchDB_vers.c
 #endif
 
-
 @implementation TDRouter
 
 
