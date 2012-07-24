@@ -23,6 +23,7 @@ extern NSString* TDReplicatorStoppedNotification;
 @interface TDReplicator : NSObject
 {
     @protected
+    NSThread* _thread;
     TDDatabase* _db;
     NSURL* _remote;
     TDReachability* _host;
@@ -44,6 +45,9 @@ extern NSString* TDReplicatorStoppedNotification;
     NSDictionary* _options;
     NSDictionary* _requestHeaders;
 }
+
++ (NSString *)progressChangedNotification;
++ (NSString *)stoppedNotification;
 
 - (id) initWithDB: (TDDatabase*)db
            remote: (NSURL*)remote

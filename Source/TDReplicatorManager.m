@@ -27,6 +27,11 @@
 #import "TDOAuth1Authorizer.h"
 #import "TDInternal.h"
 #import "TDMisc.h"
+#import "MYBlockUtils.h"
+
+#if TARGET_OS_IPHONE
+#import <UIKit/UIApplication.h>
+#endif
 
 
 NSString* const kTDReplicatorDatabaseName = @"_replicator";
@@ -47,6 +52,7 @@ NSString* const kTDReplicatorDatabaseName = @"_replicator";
         _dbManager = dbManager;
         _replicatorDB = [[dbManager databaseNamed: kTDReplicatorDatabaseName] retain];
         Assert(_replicatorDB);
+        _thread = [NSThread currentThread];
     }
     return self;
 }
@@ -71,6 +77,13 @@ NSString* const kTDReplicatorDatabaseName = @"_replicator";
     [[NSNotificationCenter defaultCenter] addObserver: self selector: @selector(someDbDeleted:)
                                                  name: TDDatabaseWillBeDeletedNotification
                                                object: nil];
+#if TARGET_OS_IPHONE
+    // Register for foreground/background transition notifications, on iOS:
+    [[NSNotificationCenter defaultCenter] addObserver: self selector: @selector(appForegrounding:)
+                                                 name: UIApplicationWillEnterForegroundNotification
+                                               object: nil];
+#endif
+    
 }
 
 
@@ -140,7 +153,7 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
         }
     }
     NSURL* remote = [NSURL URLWithString: [remoteDict objectForKey: @"url"]];
-    if (!remote || ![remote.scheme hasPrefix: @"http"])
+    if (![$array(@"http", @"https", @"touchdb") containsObject: remote.scheme.lowercaseString])
         return kTDStatusBadRequest;
     if (outDatabase) {
         *outDatabase = db;
@@ -198,32 +211,16 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
         return NO;
     }
     
-    // "_"-prefixed keys cannot be added:
-    NSDictionary* curProperties = context.currentRevision.properties;
-    for (NSString* key in newProperties) {
-        if ([key hasPrefix: @"_"] &&
-                !$equal(key, @"_id") && !$equal(key, @"_rev") &&
-                !$equal([curProperties objectForKey: key], [newProperties objectForKey: key])) {
-            context.errorMessage = $sprintf(@"Cannot add a '%@' property", key);
-            return NO;
-        }
-    }
-    
     // Only certain keys can be changed or removed:
     NSSet* deletableProperties = [NSSet setWithObjects: @"_replication_state", nil];
     NSSet* mutableProperties = [NSSet setWithObjects: @"filter", @"query_params",
                                                       @"heartbeat", @"feed", nil];
-    for (NSString* key in curProperties) {
-        id newValue = [newProperties objectForKey: key];
-        if (!newValue && [deletableProperties containsObject: key])
-            ;
-        else if (![mutableProperties containsObject: key] &&
-                !$equal([curProperties objectForKey: key], newValue)) {
-            context.errorMessage = $sprintf(@"Cannot modify the '%@' property", key);
-            return NO;
-        }
-    }
-    return YES;
+    return [context enumerateChanges: ^BOOL(NSString *key, id oldValue, id newValue) {
+        if (![context currentRevision])
+            return ![key hasPrefix: @"_"];
+        NSSet* allowed = newValue ? mutableProperties : deletableProperties;
+        return [allowed containsObject: key];
+    }];
 }
 
 
@@ -289,6 +286,8 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
 
 // A replication document has been created, so create the matching TDReplicator:
 - (void) processInsertion: (TDRevision*)rev {
+    if ([_replicatorsByDocID objectForKey: rev.docID])
+        return;
     LogTo(Sync, @"ReplicatorManager: %@ was created", rev);
     NSDictionary* properties = rev.properties;
     TDDatabase* localDb;
@@ -384,10 +383,21 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
     for (NSDictionary* row in allDocs) {
         NSDictionary* docProps = [row objectForKey: @"doc"];
         NSString* state = [docProps objectForKey: @"_replication_state"];
-        if (state==nil || $equal(state, @"triggered"))
+        if (state==nil || $equal(state, @"triggered") ||
+                    [[docProps objectForKey: @"continuous"] boolValue]) {
             [self processInsertion: [TDRevision revisionWithProperties: docProps]];
+        }
     }
     LogTo(Sync, @"ReplicatorManager done scanning.");
+}
+
+
+- (void) appForegrounding: (NSNotification*)n {
+    // Danger: This is called on the main thread!
+    MYOnThread(_thread, ^{
+        LogTo(Sync, @"App activated -- restarting all replications");
+        [self processAllDocs];
+    });
 }
 
 
@@ -434,6 +444,8 @@ static NSDictionary* parseSourceOrTarget(NSDictionary* properties, NSString* key
 
 // Notified that some database is being deleted; delete any associated replication document:
 - (void) someDbDeleted: (NSNotification*)n {
+    if (!_replicatorDB.exists)
+        return;
     TDDatabase* db = n.object;
     if ([_dbManager.allOpenDatabases indexOfObjectIdenticalTo: db] == NSNotFound)
         return;

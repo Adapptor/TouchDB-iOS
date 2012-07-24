@@ -40,11 +40,14 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
 {
     @private
     TDDatabase* _db;
-    TDRevision* _currentRevision;
+    TDRevision* _currentRevision, *_newRevision;
     TDStatus _errorType;
     NSString* _errorMessage;
+    NSArray* _changedKeys;
 }
-- (id) initWithDatabase: (TDDatabase*)db revision: (TDRevision*)currentRevision;
+- (id) initWithDatabase: (TDDatabase*)db
+               revision: (TDRevision*)currentRevision 
+               newRevision: (TDRevision*)newRevision;
 @property (readonly) TDRevision* currentRevision;
 @property TDStatus errorType;
 @property (copy) NSString* errorMessage;
@@ -417,7 +420,6 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
         return nil;
     
     //// EPILOGUE: A change notification is sent...
-    rev.body = nil;     // body is not up to date (no current _rev, likely no _id) so avoid confusion
     [self notifyChange: rev source: nil];
     return rev;
 }
@@ -548,6 +550,113 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
 }
 
 
+#pragma mark - PURGING / COMPACTING:
+
+
+- (TDStatus) compact {
+    // Can't delete any rows because that would lose revision tree history.
+    // But we can remove the JSON of non-current revisions, which is most of the space.
+    Log(@"TDDatabase: Deleting JSON of old revisions...");
+    if (![_fmdb executeUpdate: @"UPDATE revs SET json=null WHERE current=0"])
+        return kTDStatusDBError;
+
+    Log(@"Deleting old attachments...");
+    TDStatus status = [self garbageCollectAttachments];
+
+    Log(@"Vacuuming SQLite database...");
+    if (![_fmdb executeUpdate: @"VACUUM"])
+        return kTDStatusDBError;
+
+    Log(@"...Finished database compaction.");
+    return status;
+}
+
+
+- (TDStatus) purgeRevisions: (NSDictionary*)docsToRevs
+                     result: (NSDictionary**)outResult
+{
+    // <http://wiki.apache.org/couchdb/Purge_Documents>
+    NSMutableDictionary* result = $mdict();
+    if (outResult)
+        *outResult = result;
+    if (docsToRevs.count == 0)
+        return kTDStatusOK;
+    return [self inTransaction: ^TDStatus {
+        for (NSString* docID in docsToRevs) {
+            SInt64 docNumericID = [self getDocNumericID: docID];
+            if (!docNumericID) {
+                continue;  // no such document; skip it
+            }
+            NSArray* revsPurged;
+            NSArray* revIDs = $castIf(NSArray, [docsToRevs objectForKey: docID]);
+            if (!revIDs) {
+                return kTDStatusBadParam;
+            } else if (revIDs.count == 0) {
+                revsPurged = $array();
+            } else if ([revIDs containsObject: @"*"]) {
+                // Delete all revisions if magic "*" revision ID is given:
+                if (![_fmdb executeUpdate: @"DELETE FROM revs WHERE doc_id=?",
+                                           $object(docNumericID)]) {
+                    return kTDStatusDBError;
+                }
+                revsPurged = $array(@"*");
+                
+            } else {
+                // Iterate over all the revisions of the doc, in reverse sequence order.
+                // Keep track of all the sequences to delete, i.e. the given revs and ancestors,
+                // but not any non-given leaf revs or their ancestors.
+                FMResultSet* r = [_fmdb executeQuery: @"SELECT revid, sequence, parent FROM revs "
+                                                       "WHERE doc_id=? ORDER BY sequence DESC",
+                                  $object(docNumericID)];
+                if (!r)
+                    return kTDStatusDBError;
+                NSMutableSet* seqsToPurge = [NSMutableSet set];
+                NSMutableSet* seqsToKeep = [NSMutableSet set];
+                NSMutableSet* revsToPurge = [NSMutableSet set];
+                while ([r next]) {
+                    NSString* revID = [r stringForColumnIndex: 0];
+                    id sequence = $object([r longLongIntForColumnIndex: 1]);
+                    id parent = $object([r longLongIntForColumnIndex: 2]);
+                    if (([seqsToPurge containsObject: sequence] || [revIDs containsObject:revID]) &&
+                            ![seqsToKeep containsObject: sequence]) {
+                        // Purge it and maybe its parent:
+                        [seqsToPurge addObject: sequence];
+                        [revsToPurge addObject: revID];
+                        if ([parent longLongValue] > 0)
+                            [seqsToPurge addObject: parent];
+                    } else {
+                        // Keep it and its parent:
+                        [seqsToPurge removeObject: sequence];
+                        [revsToPurge removeObject: revID];
+                        [seqsToKeep addObject: parent];
+                    }
+                }
+                [r close];
+                [seqsToPurge minusSet: seqsToKeep];
+
+                LogTo(TDDatabase, @"Purging doc '%@' revs (%@); asked for (%@)",
+                      docID, [revsToPurge.allObjects componentsJoinedByString: @", "],
+                      [revIDs componentsJoinedByString: @", "]);
+
+                if (seqsToPurge.count) {
+                    // Now delete the sequences to be purged.
+                    NSString* sql = $sprintf(@"DELETE FROM revs WHERE sequence in (%@)",
+                                           [seqsToPurge.allObjects componentsJoinedByString: @","]);
+                    if (![_fmdb executeUpdate: sql])
+                        return kTDStatusDBError;
+                    if ((NSUInteger)_fmdb.changes != seqsToPurge.count)
+                        Warn(@"purgeRevisions: Only %i sequences deleted of (%@)",
+                             _fmdb.changes, [seqsToPurge.allObjects componentsJoinedByString:@","]);
+                }
+                revsPurged = revsToPurge.allObjects;
+            }
+            [result setObject: revsPurged forKey: docID];
+        }
+        return kTDStatusOK;
+    }];
+}
+
+
 #pragma mark - VALIDATION:
 
 
@@ -570,7 +679,8 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
     if (_validations.count == 0)
         return kTDStatusOK;
     TDValidationContext* context = [[TDValidationContext alloc] initWithDatabase: self
-                                                                        revision: oldRev];
+                                                                        revision: oldRev
+                                                                     newRevision: newRev];
     TDStatus status = kTDStatusOK;
     for (TDValidationBlock validationName in _validations) {
         TDValidationBlock validation = [self validationNamed: validationName];
@@ -593,11 +703,15 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
 
 @implementation TDValidationContext
 
-- (id) initWithDatabase: (TDDatabase*)db revision: (TDRevision*)currentRevision {
+- (id) initWithDatabase: (TDDatabase*)db
+               revision: (TDRevision*)currentRevision
+            newRevision: (TDRevision*)newRevision
+{
     self = [super init];
     if (self) {
         _db = db;
         _currentRevision = currentRevision;
+        _newRevision = newRevision;
         _errorType = kTDStatusForbidden;
         _errorMessage = [@"invalid document" retain];
     }
@@ -605,6 +719,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
 }
 
 - (void)dealloc {
+    [_changedKeys release];
     [_errorMessage release];
     [super dealloc];
 }
@@ -616,5 +731,58 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
 }
 
 @synthesize errorType=_errorType, errorMessage=_errorMessage;
+
+- (NSArray*) changedKeys {
+    if (!_changedKeys) {
+        NSMutableArray* changedKeys = [[NSMutableArray alloc] init];
+        NSDictionary* cur = self.currentRevision.properties;
+        NSDictionary* nuu = _newRevision.properties;
+        for (NSString* key in cur.allKeys) {
+            if (!$equal([cur objectForKey: key], [nuu objectForKey: key])
+                    && ![key isEqualToString: @"_rev"])
+                [changedKeys addObject: key];
+        }
+        for (NSString* key in nuu.allKeys) {
+            if (![cur objectForKey: key]
+                    && ![key isEqualToString: @"_rev"] && ![key isEqualToString: @"_id"])
+                [changedKeys addObject: key];
+        }
+        _changedKeys = changedKeys;
+    }
+    return _changedKeys;
+}
+
+- (BOOL) allowChangesOnlyTo: (NSArray*)keys {
+    for (NSString* key in self.changedKeys) {
+        if (![keys containsObject: key]) {
+            self.errorMessage = $sprintf(@"The '%@' property may not be changed", key);
+            return NO;
+        }
+    }
+    return YES;
+}
+
+- (BOOL) disallowChangesTo: (NSArray*)keys {
+    for (NSString* key in self.changedKeys) {
+        if ([keys containsObject: key]) {
+            self.errorMessage = $sprintf(@"The '%@' property may not be changed", key);
+            return NO;
+        }
+    }
+    return YES;
+}
+
+- (BOOL) enumerateChanges: (TDChangeEnumeratorBlock)enumerator {
+    NSDictionary* cur = self.currentRevision.properties;
+    NSDictionary* nuu = _newRevision.properties;
+    for (NSString* key in self.changedKeys) {
+        if (!enumerator(key, [cur objectForKey: key], [nuu objectForKey: key])) {
+            if (!_errorMessage)
+                self.errorMessage = $sprintf(@"Illegal change to '%@' property", key);
+            return NO;
+        }
+    }
+    return YES;
+}
 
 @end

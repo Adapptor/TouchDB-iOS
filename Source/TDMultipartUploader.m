@@ -19,18 +19,27 @@
 @implementation TDMultipartUploader
 
 - (id) initWithURL: (NSURL *)url
-          streamer: (TDMultipartWriter*)streamer
-        authorizer: (id<TDAuthorizer>)authorizer
+          streamer: (TDMultipartWriter*)writer
     requestHeaders: (NSDictionary *) requestHeaders
       onCompletion: (TDRemoteRequestCompletionBlock)onCompletion
 {
-    Assert(streamer);
-    return [super initWithMethod: @"PUT" 
+    Assert(writer);
+    self = [super initWithMethod: @"PUT" 
                              URL: url 
-                            body: streamer
-                      authorizer: authorizer
-                  requestHeaders:requestHeaders 
+                            body: writer
+                  requestHeaders: requestHeaders 
                     onCompletion: onCompletion];
+    if (self) {
+        _multipartWriter = [writer retain];
+        // It's important to set a Content-Length header -- without this, CFNetwork won't know the
+        // length of the body stream, so it has to send the body chunked. But unfortunately CouchDB
+        // doesn't correctly parse chunked multipart bodies:
+        // https://issues.apache.org/jira/browse/COUCHDB-1403
+        SInt64 length = _multipartWriter.length;
+        Assert(length >= 0, @"HTTP multipart upload body has indeterminate length");
+        [_request setValue: $sprintf(@"%lld", length) forHTTPHeaderField: @"Content-Length"];
+    }
+    return self;
 }
 
 
@@ -40,17 +49,18 @@
 }
 
 
-- (void) setupRequest: (NSMutableURLRequest*)request withBody: (id)body {
-    _multipartWriter = $cast(TDMultipartWriter, [body retain]);
-    [_multipartWriter openForURLRequest: request];
+- (void) start {
+    [_multipartWriter openForURLRequest: _request];
+    [super start];
+}
 
-    // It's important to set a Content-Length header -- without this, CFNetwork won't know the
-    // length of the body stream, so it has to send the body chunked. But unfortunately CouchDB
-    // doesn't correctly parse chunked multipart bodies:
-    // https://issues.apache.org/jira/browse/COUCHDB-1403
-    SInt64 length = _multipartWriter.length;
-    Assert(length >= 0, @"HTTP multipart upload body has indeterminate length");
-    [request setValue: $sprintf(@"%lld", length) forHTTPHeaderField: @"Content-Length"];
+
+- (NSInputStream *)connection:(NSURLConnection *)connection
+            needNewBodyStream:(NSURLRequest *)request
+{
+    LogTo(TDRemoteRequest, @"%@: Needs new body stream, resetting writer...", self);
+    [_multipartWriter close];
+    return [_multipartWriter openForInputStream];
 }
 
 
