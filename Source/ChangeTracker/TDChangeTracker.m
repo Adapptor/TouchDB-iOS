@@ -95,7 +95,10 @@ static NSURL* AddDotToURLHost( NSURL* url );
     // don't end up using the same socket pool as regular connections to the same host; otherwise
     // the regular connections can get stuck indefinitely behind a long-running one.
     // (This substitution appends a "." to the host name, if it didn't already end with one.)
-    NSURL* url = AddDotToURLHost(_databaseURL);
+
+    // Commenting this out as it makes Apache unable to handle SSL urls
+//    NSURL* url = AddDotToURLHost(_databaseURL);
+    NSURL *url = _databaseURL;
 
     NSMutableString* urlStr = [[url.absoluteString mutableCopy] autorelease];
     if (![urlStr hasSuffix: @"/"])

@@ -42,7 +42,6 @@ extern double TouchDBVersionNumber; // Defined in Xcode-generated TouchDB_vers.c
 - (TDStatus) do_GETRoot;
 @end
 
-
 @implementation TDRouter
 
 
