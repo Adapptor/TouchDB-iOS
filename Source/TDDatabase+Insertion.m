@@ -113,7 +113,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
     MD5_Update(&ctx, &deletedByte, 1);
     
     for (NSString* attName in [attachments.allKeys sortedArrayUsingSelector: @selector(compare:)]) {
-        TDAttachment* attachment = [attachments objectForKey: attName];
+        TDAttachment* attachment = attachments[attName];
         MD5_Update(&ctx, &attachment->blobKey, sizeof(attachment->blobKey));
     }
     
@@ -137,12 +137,12 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
 /** Extracts the history of revision IDs (in reverse chronological order) from the _revisions key */
 + (NSArray*) parseCouchDBRevisionHistory: (NSDictionary*)docProperties {
     NSDictionary* revisions = $castIf(NSDictionary,
-                                      [docProperties objectForKey: @"_revisions"]);
+                                      docProperties[@"_revisions"]);
     if (!revisions)
         return nil;
     // Extract the history, expanding the numeric prefixes:
-    NSArray* revIDs = $castIf(NSArray, [revisions objectForKey: @"ids"]);
-    __block int start = [$castIf(NSNumber, [revisions objectForKey: @"start"]) intValue];
+    NSArray* revIDs = $castIf(NSArray, revisions[@"ids"]);
+    __block int start = [$castIf(NSNumber, revisions[@"start"]) intValue];
     if (start)
         revIDs = [revIDs my_map: ^(id revID) {return $sprintf(@"%d-%@", start--, revID);}];
     return revIDs;
@@ -173,7 +173,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
     NSMutableDictionary* properties = [[NSMutableDictionary alloc] initWithCapacity: origProps.count];
     for (NSString* key in origProps) {
         if (![key hasPrefix: @"_"]  || [sSpecialKeysToLeave member: key]) {
-            [properties setObject: [origProps objectForKey: key] forKey: key];
+            properties[key] = origProps[key];
         } else if (![sSpecialKeysToRemove member: key]) {
             Log(@"TDDatabase: Invalid top-level key '%@' in document to be inserted", key);
             [properties release];
@@ -190,12 +190,48 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
 }
 
 
+- (TDRevision*) winnerWithDocID: (SInt64)docNumericID
+                      oldWinner: (NSString*)oldWinningRevID
+                     oldDeleted: (BOOL)oldWinnerWasDeletion
+                         newRev: (TDRevision*)newRev
+{
+    if (!oldWinningRevID)
+        return newRev;
+    NSString* newRevID = newRev.revID;
+    if (!newRev.deleted) {
+        if (oldWinnerWasDeletion || TDCompareRevIDs(newRevID, oldWinningRevID) > 0)
+            return newRev;   // this is now the winning live revision
+    } else if (oldWinnerWasDeletion) {
+        if (TDCompareRevIDs(newRevID, oldWinningRevID) > 0)
+            return newRev;  // doc still deleted, but this beats previous deletion rev
+    } else {
+        // Doc was alive. How does this deletion affect the winning rev ID?
+        BOOL deleted;
+        NSString* winningRevID = [self winningRevIDOfDocNumericID: docNumericID
+                                                        isDeleted: &deleted];
+        if (!$equal(winningRevID, oldWinningRevID)) {
+            if ($equal(winningRevID, newRev.revID))
+                return newRev;
+            else {
+                TDRevision* winningRev = [[[TDRevision alloc] initWithDocID: newRev.docID
+                                                                      revID: winningRevID
+                                                                    deleted: NO] autorelease];
+                return winningRev;
+            }
+        }
+    }
+    return nil; // no change
+}
+
+
 /** Posts a local NSNotification of a new revision of a document. */
-- (void) notifyChange: (TDRevision*)rev source: (NSURL*)source
+- (void) notifyChange: (TDRevision*)rev
+               source: (NSURL*)source
+           winningRev: (TDRevision*)winningRev
 {
     NSDictionary* userInfo = $dict({@"rev", rev},
-                                   {@"seq", $object(rev.sequence)},
-                                   {@"source", source});
+                                   {@"source", source},
+                                   {@"winner", winningRev});
     [[NSNotificationCenter defaultCenter] postNotificationName: TDDatabaseChangeNotification
                                                         object: self
                                                       userInfo: userInfo];
@@ -209,18 +245,13 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                           current: (BOOL)current
                              JSON: (NSData*)json
 {
-    // Don't store a SQL null in the 'json' column -- I reserve it to mean that the revision data
-    // has been lost due to compaction. Instead, store an empty zero-length blob.
-    if (json == nil)
-        json = [NSData data];
-    
     if (![_fmdb executeUpdate: @"INSERT INTO revs (doc_id, revid, parent, current, deleted, json) "
                                 "VALUES (?, ?, ?, ?, ?, ?)",
-                               $object(docNumericID),
+                               @(docNumericID),
                                rev.revID,
-                               (parentSequence ? $object(parentSequence) : nil ),
-                               $object(current),
-                               $object(rev.deleted),
+                               (parentSequence ? @(parentSequence) : nil ),
+                               @(current),
+                               @(rev.deleted),
                                json])
         return 0;
     return rev.sequence = _fmdb.lastInsertRowId;
@@ -256,6 +287,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
     [self beginTransaction];
     FMResultSet* r = nil;
     TDStatus status;
+    TDRevision* winningRev = nil;
     @try {
         //// PART I: In which are performed lookups and validations prior to the insert...
         
@@ -270,7 +302,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
             NSString* sql = $sprintf(@"SELECT sequence FROM revs "
                                       "WHERE doc_id=? AND revid=? %@ LIMIT 1",
                                      (allowConflict ? @"" : @"AND current=1"));
-            parentSequence = [_fmdb longLongForQuery: sql, $object(docNumericID), prevRevID];
+            parentSequence = [_fmdb longLongForQuery: sql, @(docNumericID), prevRevID];
             if (parentSequence == 0) {
                 // Not found: kTDStatusNotFound or a kTDStatusConflict, depending on whether there is any current revision
                 if (!allowConflict && [self existsDocumentWithID: docID revisionID: nil])
@@ -291,11 +323,6 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                     return nil;
                 }
             }
-            
-            // Make replaced rev non-current:
-            if (![_fmdb executeUpdate: @"UPDATE revs SET current=0 WHERE sequence=?",
-                                       $object(parentSequence)])
-                return nil;
             
         } else {
             // Inserting first revision.
@@ -323,14 +350,14 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                     // Doc ID exists; check whether current winning revision is deleted:
                     r = [_fmdb executeQuery: @"SELECT sequence, deleted FROM revs "
                                               "WHERE doc_id=? and current=1 ORDER BY revid DESC LIMIT 1",
-                                             $object(docNumericID)];
+                                             @(docNumericID)];
                     if (!r)
                         return nil;
                     if ([r next]) {
                         if ([r boolForColumnIndex: 1]) {
                             // Make the deleted revision no longer current:
                             if (![_fmdb executeUpdate: @"UPDATE revs SET current=0 WHERE sequence=?",
-                                                       $object([r longLongIntForColumnIndex: 0])])
+                                                       @([r longLongIntForColumnIndex: 0])])
                                 return nil;
                         } else if (!allowConflict) {
                             // The current winning revision is not deleted, so this is a conflict
@@ -349,6 +376,12 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                     return nil;
             }
         }
+
+        // Look up which rev is the winner, before this insertion
+        //OPT: This rev ID could be cached in the 'docs' row
+        BOOL oldWinnerWasDeletion;
+        NSString* oldWinningRevID = [self winningRevIDOfDocNumericID: docNumericID
+                                                           isDeleted: &oldWinnerWasDeletion];
         
         //// PART II: In which insertion occurs...
         
@@ -381,6 +414,13 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
         rev = [[rev copyWithDocID: docID revID: newRevID] autorelease];
         
         // Now insert the rev itself:
+        
+        // Don't store a SQL null in the 'json' column -- I reserve it to mean that the revision data
+        // is missing due to compaction or replication.
+        // Instead, store an empty zero-length blob.
+        if (json == nil)
+            json = [NSData data];
+        
         SequenceNumber sequence = [self insertRevision: rev
                                           docNumericID: docNumericID
                                         parentSequence: parentSequence
@@ -398,6 +438,13 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
             }
         }
         
+        // Make replaced rev non-current:
+        if (parentSequence > 0) {
+            if (![_fmdb executeUpdate: @"UPDATE revs SET current=0 WHERE sequence=?",
+                                       @(parentSequence)])
+                return nil;
+        }
+
         // Store any attachments:
         status = [self processAttachments: attachments
                               forRevision: rev
@@ -406,7 +453,12 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
             *outStatus = status;
             return nil;
         }
-        
+
+        // Figure out what the new winning rev ID is:
+        winningRev = [self winnerWithDocID: docNumericID
+                                 oldWinner: oldWinningRevID oldDeleted: oldWinnerWasDeletion
+                                    newRev: rev];
+
         // Success!
         *outStatus = deleted ? kTDStatusOK : kTDStatusCreated;
         
@@ -420,7 +472,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
         return nil;
     
     //// EPILOGUE: A change notification is sent...
-    [self notifyChange: rev source: nil];
+    [self notifyChange: rev source: nil winningRev: winningRev];
     return rev;
 }
 
@@ -437,12 +489,13 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
     
     NSUInteger historyCount = history.count;
     if (historyCount == 0) {
-        history = $array(revID);
+        history = @[revID];
         historyCount = 1;
-    } else if (!$equal([history objectAtIndex: 0], revID))
+    } else if (!$equal(history[0], revID))
         return kTDStatusBadID;
     
     BOOL success = NO;
+    TDRevision* winningRev = nil;
     [self beginTransaction];
     @try {
         // First look up the document's row-id and all locally-known revisions of it:
@@ -464,7 +517,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
         if (_validations.count > 0) {
             TDRevision* oldRev = nil;
             for (NSUInteger i = 1; i<historyCount; ++i) {
-                oldRev = [localRevs revWithDocID: docID revID: [history objectAtIndex: i]];
+                oldRev = [localRevs revWithDocID: docID revID: history[i]];
                 if (oldRev)
                     break;
             }
@@ -473,13 +526,19 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                 return status;
         }
         
+        // Look up which rev is the winner, before this insertion
+        //OPT: This rev ID could be cached in the 'docs' row
+        BOOL oldWinnerWasDeletion;
+        NSString* oldWinningRevID = [self winningRevIDOfDocNumericID: docNumericID
+                                                           isDeleted: &oldWinnerWasDeletion];
+
         // Walk through the remote history in chronological order, matching each revision ID to
         // a local revision. When the list diverges, start creating blank local revisions to fill
         // in the local history:
         SequenceNumber sequence = 0;
         SequenceNumber localParentSequence = 0;
         for (NSInteger i = historyCount - 1; i>=0; --i) {
-            NSString* revID = [history objectAtIndex: i];
+            NSString* revID = history[i];
             TDRevision* localRev = [localRevs revWithDocID: docID revID: revID];
             if (localRev) {
                 // This revision is known locally. Remember its sequence as the parent of the next one:
@@ -495,11 +554,9 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                 if (i==0) {
                     // Hey, this is the leaf revision we're inserting:
                     newRev = rev;
-                    if (!rev.deleted) {
-                        json = [self encodeDocumentJSON: rev];
-                        if (!json)
-                            return kTDStatusBadJSON;
-                    }
+                    json = [self encodeDocumentJSON: rev];
+                    if (!json)
+                        return kTDStatusBadJSON;
                     current = YES;
                 } else {
                     // It's an intermediate parent, so insert a stub:
@@ -535,9 +592,15 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
         // Mark the latest local rev as no longer current:
         if (localParentSequence > 0 && localParentSequence != sequence) {
             if (![_fmdb executeUpdate: @"UPDATE revs SET current=0 WHERE sequence=?",
-                  $object(localParentSequence)])
+                  @(localParentSequence)])
                 return kTDStatusDBError;
         }
+
+        // Figure out what the new winning rev ID is:
+        winningRev = [self winnerWithDocID: docNumericID
+                                 oldWinner: oldWinningRevID oldDeleted: oldWinnerWasDeletion
+                                    newRev: rev];
+
 
         success = YES;
     } @finally {
@@ -545,7 +608,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
     }
     
     // Notify and return:
-    [self notifyChange: rev source: source];
+    [self notifyChange: rev source: source winningRev: winningRev];
     return kTDStatusCreated;
 }
 
@@ -588,18 +651,18 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                 continue;  // no such document; skip it
             }
             NSArray* revsPurged;
-            NSArray* revIDs = $castIf(NSArray, [docsToRevs objectForKey: docID]);
+            NSArray* revIDs = $castIf(NSArray, docsToRevs[docID]);
             if (!revIDs) {
                 return kTDStatusBadParam;
             } else if (revIDs.count == 0) {
-                revsPurged = $array();
+                revsPurged = @[];
             } else if ([revIDs containsObject: @"*"]) {
                 // Delete all revisions if magic "*" revision ID is given:
                 if (![_fmdb executeUpdate: @"DELETE FROM revs WHERE doc_id=?",
-                                           $object(docNumericID)]) {
+                                           @(docNumericID)]) {
                     return kTDStatusDBError;
                 }
-                revsPurged = $array(@"*");
+                revsPurged = @[@"*"];
                 
             } else {
                 // Iterate over all the revisions of the doc, in reverse sequence order.
@@ -607,7 +670,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                 // but not any non-given leaf revs or their ancestors.
                 FMResultSet* r = [_fmdb executeQuery: @"SELECT revid, sequence, parent FROM revs "
                                                        "WHERE doc_id=? ORDER BY sequence DESC",
-                                  $object(docNumericID)];
+                                  @(docNumericID)];
                 if (!r)
                     return kTDStatusDBError;
                 NSMutableSet* seqsToPurge = [NSMutableSet set];
@@ -615,8 +678,8 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                 NSMutableSet* revsToPurge = [NSMutableSet set];
                 while ([r next]) {
                     NSString* revID = [r stringForColumnIndex: 0];
-                    id sequence = $object([r longLongIntForColumnIndex: 1]);
-                    id parent = $object([r longLongIntForColumnIndex: 2]);
+                    id sequence = @([r longLongIntForColumnIndex: 1]);
+                    id parent = @([r longLongIntForColumnIndex: 2]);
                     if (([seqsToPurge containsObject: sequence] || [revIDs containsObject:revID]) &&
                             ![seqsToKeep containsObject: sequence]) {
                         // Purge it and maybe its parent:
@@ -650,7 +713,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
                 }
                 revsPurged = revsToPurge.allObjects;
             }
-            [result setObject: revsPurged forKey: docID];
+            result[docID] = revsPurged;
         }
         return kTDStatusOK;
     }];
@@ -671,7 +734,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
 }
 
 - (TDValidationBlock) validationNamed: (NSString*)validationName {
-    return [_validations objectForKey: validationName];
+    return _validations[validationName];
 }
 
 
@@ -738,12 +801,12 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
         NSDictionary* cur = self.currentRevision.properties;
         NSDictionary* nuu = _newRevision.properties;
         for (NSString* key in cur.allKeys) {
-            if (!$equal([cur objectForKey: key], [nuu objectForKey: key])
+            if (!$equal(cur[key], nuu[key])
                     && ![key isEqualToString: @"_rev"])
                 [changedKeys addObject: key];
         }
         for (NSString* key in nuu.allKeys) {
-            if (![cur objectForKey: key]
+            if (!cur[key]
                     && ![key isEqualToString: @"_rev"] && ![key isEqualToString: @"_id"])
                 [changedKeys addObject: key];
         }
@@ -776,7 +839,7 @@ NSString* const TDDatabaseChangeNotification = @"TDDatabaseChange";
     NSDictionary* cur = self.currentRevision.properties;
     NSDictionary* nuu = _newRevision.properties;
     for (NSString* key in self.changedKeys) {
-        if (!enumerator(key, [cur objectForKey: key], [nuu objectForKey: key])) {
+        if (!enumerator(key, cur[key], nuu[key])) {
             if (!_errorMessage)
                 self.errorMessage = $sprintf(@"Illegal change to '%@' property", key);
             return NO;

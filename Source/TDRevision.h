@@ -19,9 +19,10 @@ typedef SInt64 SequenceNumber;
 {
     @private
     NSString* _docID, *_revID;
-    BOOL _deleted;
     TDBody* _body;
     SequenceNumber _sequence;
+    bool _deleted;
+    bool _missing;
 }
 
 - (id) initWithDocID: (NSString*)docID 
@@ -34,11 +35,14 @@ typedef SInt64 SequenceNumber;
 
 @property (readonly) NSString* docID;
 @property (readonly) NSString* revID;
-@property (readonly) BOOL deleted;
+@property (readonly) bool deleted;
+@property bool missing;
 
 @property (retain) TDBody* body;
 @property (copy) NSDictionary* properties;
 @property (copy) NSData* asJSON;
+
+- (id) objectForKeyedSubscript: (NSString*)key;  // enables subscript access in Xcode 4.4+
 
 @property SequenceNumber sequence;
 
@@ -79,6 +83,8 @@ typedef SInt64 SequenceNumber;
 @property (readonly) NSArray* allRevisions;
 @property (readonly) NSArray* allDocIDs;
 @property (readonly) NSArray* allRevIDs;
+
+- (TDRevision*) objectAtIndexedSubscript: (NSUInteger)index;  // enables subscript access in XC4.4+
 
 - (void) addRev: (TDRevision*)rev;
 - (void) removeRev: (TDRevision*)rev;

@@ -35,6 +35,9 @@ static NSMutableDictionary* sHostMap;
 }
 
 
+#pragma mark - REGISTERING SERVERS:
+
+
 + (void) setServer: (TDServer*)server {
     @synchronized(self) {
         [self registerServer: server forHostname: nil];
@@ -86,7 +89,7 @@ static NSString* normalizeHostname( NSString* hostname ) {
             int count = 0;
             do {
                 hostname = $sprintf(@"server%d", ++count);
-            } while ([sHostMap objectForKey: hostname]);
+            } while (sHostMap[hostname]);
         }
         [self registerServer: server forHostname: hostname];
         return [self rootURLForHostname: hostname];
@@ -103,8 +106,23 @@ static NSString* normalizeHostname( NSString* hostname ) {
 
 + (TDServer*) serverForHostname: (NSString*)hostname {
     @synchronized(self) {
-        return [sHostMap objectForKey: normalizeHostname(hostname)];
+        return sHostMap[normalizeHostname(hostname)];
     }
+}
+
+
++ (TDServer*) serverForURL: (NSURL*)url {
+    NSString* scheme = url.scheme.lowercaseString;
+    if ([scheme isEqualToString: kScheme])
+        return [self serverForHostname: url.host];
+    if ([scheme isEqualToString: @"http"] || [scheme isEqualToString: @"https"]) {
+        NSString* host = url.host;
+        if ([host hasSuffix: @".touchdb."]) {
+            host = [host substringToIndex: host.length - 9];
+            return [self serverForHostname: host];
+        }
+    }
+    return nil;
 }
 
 
@@ -112,9 +130,20 @@ static NSString* normalizeHostname( NSString* hostname ) {
     return [NSURL URLWithString: kScheme ":///"];
 }
 
++ (NSURL*) HTTPURLForServerURL: (NSURL*)serverURL {
+    return [NSURL URLWithString: $sprintf(@"http://%@.touchdb./", normalizeHostname(serverURL.host))];
+}
+
+
+#pragma mark - INITIALIZATION:
+
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    return [request.URL.scheme caseInsensitiveCompare: kScheme] == 0;
+    NSURL* url = request.URL;
+    if ([url.scheme caseInsensitiveCompare: kScheme] == 0)
+        return YES;
+    else
+        return [self serverForURL: url] != nil;
 }
 
 
@@ -130,9 +159,12 @@ static NSString* normalizeHostname( NSString* hostname ) {
 }
 
 
+#pragma mark - LOADING:
+
+
 - (void) startLoading {
     LogTo(TDURLProtocol, @"Loading <%@>", self.request.URL);
-    TDServer* server = [[self class] serverForHostname: self.request.URL.host];
+    TDServer* server = [[self class] serverForURL: self.request.URL];
     if (!server) {
         NSError* error = [NSError errorWithDomain: NSURLErrorDomain
                                              code: NSURLErrorCannotFindHost userInfo: nil];
@@ -141,7 +173,7 @@ static NSString* normalizeHostname( NSString* hostname ) {
     }
     
     NSThread* loaderThread = [NSThread currentThread];
-    _router = [[TDRouter alloc] initWithServer: server request: self.request];
+    _router = [[TDRouter alloc] initWithServer: server request: self.request isLocal: YES];
     _router.onResponseReady = ^(TDResponse* routerResponse) {
         [self performSelector: @selector(onResponseReady:)
                      onThread: loaderThread
@@ -263,7 +295,7 @@ TestCase(TDURLProtocol) {
     CAssert(body != nil);
     CAssert(response != nil);
     CAssertEq(response.statusCode, kTDStatusOK);
-    CAssertEqual([response.allHeaderFields objectForKey: @"Content-Type"], @"application/json");
+    CAssertEqual((response.allHeaderFields)[@"Content-Type"], @"application/json");
     CAssert([bodyStr rangeOfString: @"\"TouchDB\":\"Welcome\""].length > 0
             || [bodyStr rangeOfString: @"\"TouchDB\": \"Welcome\""].length > 0);
     [server close];

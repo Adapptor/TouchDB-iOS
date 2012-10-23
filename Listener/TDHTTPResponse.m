@@ -36,6 +36,8 @@
 - (id) initWithRouter: (TDRouter*)router forConnection:(TDHTTPConnection*)connection {
     self = [super init];
     if (self) {
+        //EnableLog(YES);
+        //EnableLogTo(TDListenerVerbose, YES);
         _router = [router retain];
         _connection = connection;
         router.onResponseReady = ^(TDResponse* r) {
@@ -51,9 +53,15 @@
         if (connection.listener.readOnly) {
             router.onAccessCheck = ^TDStatus(TDDatabase* db, NSString* docID, SEL action) {
                 NSString* method = router.request.HTTPMethod;
-                if (![method isEqualToString: @"GET"] && ![method isEqualToString: @"HEAD"])
-                    return kTDStatusForbidden;
-                return kTDStatusOK;
+                if ([method isEqualToString: @"GET"] || [method isEqualToString: @"HEAD"])
+                    return kTDStatusOK;
+                if ([method isEqualToString: @"POST"]) {
+                    NSString* actionStr = NSStringFromSelector(action);
+                    if ([actionStr isEqualToString: @"do_POST_all_docs:"]
+                            || [actionStr isEqualToString: @"do_POST_revs_diff:"])
+                        return kTDStatusOK;
+                }
+                return kTDStatusForbidden;
             };
         }
         
@@ -213,7 +221,7 @@
 
         LogTo(TDListenerVerbose, @"%@ Finished!", self);
 
-        if (!_chunked || _offset == 0) {
+        if ((!_chunked || _offset == 0) && ![_router.request.HTTPMethod isEqualToString: @"HEAD"]) {
             // Response finished immediately, before the connection asked for any data, so we're free
             // to massage the response:
             LogTo(TDListenerVerbose, @"%@ prettifying response body", self);
@@ -223,9 +231,8 @@
             BOOL pretty = [_router boolQuery: @"pretty"];
 #endif
             if (pretty) {
-                NSString* contentType = [_response.headers objectForKey: @"Content-Type"];
-                if ([contentType hasPrefix: @"application/json"]) {
-                    NSAssert(_data.length < 100000, @"Data too long"); //TEMP
+                NSString* contentType = (_response.headers)[@"Content-Type"];
+                if ([contentType hasPrefix: @"application/json"] && _data.length < 100000) {
                     [_data release];
                     _data = [_response.body.asPrettyJSON mutableCopy];
                 }

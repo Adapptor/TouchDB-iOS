@@ -80,8 +80,8 @@
     char *dst = &out[0];
     for( size_t i=0; i<sizeof(key.bytes); i+=1 )
         dst += sprintf(dst,"%02X", key.bytes[i]);
-    strcat(out, ".");
-    strcat(out, kFileExtension);
+    strlcat(out, ".", sizeof(out));
+    strlcat(out, kFileExtension, sizeof(out));
     NSString* name =  [[NSString alloc] initWithCString: out encoding: NSASCIIStringEncoding];
     NSString* path = [_path stringByAppendingPathComponent: name];
     [name release];
@@ -135,7 +135,12 @@
     if ([[NSFileManager defaultManager] isReadableFileAtPath: path])
         return YES;
     NSError* error;
-    if (![blob writeToFile: path options: NSDataWritingAtomic error: &error]) {
+    if (![blob writeToFile: path
+                   options: NSDataWritingAtomic
+#if TARGET_OS_IPHONE
+                            | NSDataWritingFileProtectionCompleteUnlessOpen
+#endif
+                     error: &error]) {
         Warn(@"TDBlobStore: Couldn't write to %@: %@", path, error);
         return NO;
     }
@@ -256,7 +261,16 @@
             [self release];
             return nil;
         }
-        [[NSFileManager defaultManager] createFileAtPath: _tempPath contents: nil attributes: nil];
+        NSDictionary* attributes = nil;
+#if TARGET_OS_IPHONE
+        attributes = @{NSFileProtectionKey: NSFileProtectionCompleteUnlessOpen};
+#endif
+        if (![[NSFileManager defaultManager] createFileAtPath: _tempPath
+                                                     contents: nil
+                                                   attributes: attributes]) {
+            [self release];
+            return nil;
+        }
         _out = [[NSFileHandle fileHandleForWritingAtPath: _tempPath] retain];
         if (!_out) {
             [self release];

@@ -81,7 +81,7 @@ static NSURL* AddDotToURLHost( NSURL* url );
     if (_filterName) {
         [path appendFormat: @"&filter=%@", TDEscapeURLParam(_filterName)];
         for (NSString* key in _filterParameters) {
-            id value = [_filterParameters objectForKey: key];
+            id value = _filterParameters[key];
             [path appendFormat: @"&%@=%@", TDEscapeURLParam(key), 
                                            TDEscapeURLParam([value description])];
         }
@@ -152,8 +152,9 @@ static NSURL* AddDotToURLHost( NSURL* url );
 - (void) failedWithError: (NSError*)error {
     // If the error may be transient (flaky network, server glitch), retry:
     if (TDMayBeTransientError(error)) {
-        NSTimeInterval retryDelay = kInitialRetryDelay * (1 << MIN(_retryCount-1, 31U));
+        NSTimeInterval retryDelay = kInitialRetryDelay * (1 << MIN(_retryCount, 16U));
         retryDelay = MIN(retryDelay, kMaxRetryDelay);
+        ++_retryCount;
         Log(@"%@: Connection error, retrying in %.1f sec: %@",
             self, retryDelay, error.localizedDescription);
         [self performSelector: @selector(retry) withObject: nil afterDelay: retryDelay];
@@ -176,28 +177,49 @@ static NSURL* AddDotToURLHost( NSURL* url );
 - (BOOL) receivedChange: (NSDictionary*)change {
     if (![change isKindOfClass: [NSDictionary class]])
         return NO;
-    id seq = [change objectForKey: @"seq"];
+    id seq = change[@"seq"];
     if (!seq) {
         // If a continuous feed closes (e.g. if its database is deleted), the last line it sends
         // will indicate the last_seq. This is normal, just ignore it and return success:
-        return [change objectForKey: @"last_seq"] != nil;
+        return change[@"last_seq"] != nil;
     }
     [_client changeTrackerReceivedChange: change];
     self.lastSequenceID = seq;
     return YES;
 }
 
-- (NSInteger) receivedPollResponse: (NSData*)body {
-    if (!body)
+- (NSInteger) receivedPollResponse: (NSData*)body errorMessage: (NSString**)errorMessage {
+    if (!body) {
+        *errorMessage = @"No body in response";
         return -1;
-    id changeObj = [TDJSON JSONObjectWithData: body options: 0 error: NULL];
+    }
+    NSError* error;
+    id changeObj = [TDJSON JSONObjectWithData: body options: 0 error: &error];
+    if (!changeObj) {
+        *errorMessage = $sprintf(@"JSON parse error: %@", error.localizedDescription);
+        return -1;
+    }
     NSDictionary* changeDict = $castIf(NSDictionary, changeObj);
-    NSArray* changes = $castIf(NSArray, [changeDict objectForKey: @"results"]);
-    if (!changes)
+    NSArray* changes = $castIf(NSArray, changeDict[@"results"]);
+    if (!changes) {
+        *errorMessage = @"No 'changes' array in response";
         return -1;
-    for (NSDictionary* change in changes) {
-        if (![self receivedChange: change])
-            return -1;
+    }
+
+    if ([_client respondsToSelector: @selector(changeTrackerReceivedChanges:)]) {
+        [_client changeTrackerReceivedChanges: changes];
+        if (changes.count > 0)
+            self.lastSequenceID = [[changes lastObject] objectForKey: @"seq"];
+    } else {
+        for (NSDictionary* change in changes) {
+            if (![self receivedChange: change]) {
+                *errorMessage = $sprintf(@"Invalid change object: %@",
+                                         [TDJSON stringWithJSONObject: change
+                                                              options:TDJSONWritingAllowFragments
+                                                                error: nil]);
+                return -1;
+            }
+        }
     }
     return changes.count;
 }
