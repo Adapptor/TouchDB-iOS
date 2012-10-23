@@ -40,6 +40,7 @@ typedef struct TDQueryOptions {
     BOOL inclusiveEnd;
     BOOL reduce;
     BOOL group;
+    BOOL includeDeletedDocs;        // only works with _all_docs, not regular views
 } TDQueryOptions;
 
 extern const TDQueryOptions kDefaultTDQueryOptions;
@@ -69,6 +70,7 @@ typedef enum {
     TDMapBlock _mapBlock;
     TDReduceBlock _reduceBlock;
     TDViewCollation _collation;
+    TDContentOptions _mapContentOptions;
 }
 
 - (void) deleteView;
@@ -80,6 +82,7 @@ typedef enum {
 @property (readonly) TDReduceBlock reduceBlock;
 
 @property TDViewCollation collation;
+@property TDContentOptions mapContentOptions;
 
 - (BOOL) setMapBlock: (TDMapBlock)mapBlock
          reduceBlock: (TDReduceBlock)reduceBlock

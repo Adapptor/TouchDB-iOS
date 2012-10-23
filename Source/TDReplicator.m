@@ -36,6 +36,8 @@
 #define kProcessDelay 0.5
 #define kInboxCapacity 100
 
+#define kRetryDelay 60.0
+
 
 NSString* TDReplicatorProgressChangedNotification = @"TDReplicatorProgressChanged";
 NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
@@ -109,14 +111,25 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
     [_authorizer release];
     [_options release];
     [_requestHeaders release];
+    [_remoteRequests release];
     [super dealloc];
+}
+
+
+- (void) clearDbRef {
+    // If we're in the middle of saving the checkpoint and waiting for a response, by the time the
+    // response arrives _db will be nil, so there won't be any way to save the checkpoint locally.
+    // To avoid that, pre-emptively save the local checkpoint now.
+    if (_savingCheckpoint && _lastSequence)
+        [_db setLastSequence: _lastSequence withCheckpointID: self.remoteCheckpointDocID];
+    _db = nil;
 }
 
 
 - (void) databaseClosing {
     [self saveLastSequence];
     [self stop];
-    _db = nil;
+    [self clearDbRef];
 }
 
 
@@ -181,15 +194,10 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
     [self postProgressChanged];
 }
 
-- (void) updateActive {
-    BOOL active = _batcher.count > 0 || _asyncTaskCount > 0;
-    if (active != _active) {
-        self.active = active;
-        [self postProgressChanged];
-    }
-}
-
 - (void) setError:(NSError *)error {
+    if (error.code == NSURLErrorCancelled && $equal(error.domain, NSURLErrorDomain))
+        return;
+    
     if (ifSetObj(&_error, error))
         [self postProgressChanged];
 }
@@ -245,7 +253,7 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
     if (!_running)
         return;
     LogTo(Sync, @"%@ STOPPING...", self);
-    [_batcher flush];
+    [_batcher flushAll];
     _continuous = NO;
 #if TARGET_OS_IPHONE
     // Unregister for background transition notifications, on iOS:
@@ -253,7 +261,10 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
                                                  name: UIApplicationDidEnterBackgroundNotification
                                                object: nil];
 #endif
-    if (_asyncTaskCount == 0)
+    [self stopRemoteRequests];
+    [NSObject cancelPreviousPerformRequestsWithTarget: self
+                                             selector: @selector(retryIfReady) object: nil];
+    if (_running && _asyncTaskCount == 0)
         [self stopped];
 }
 
@@ -270,32 +281,56 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
     setObj(&_batcher, nil);
     [_host stop];
     setObj(&_host, nil);
-    _db = nil;  // _db no longer tracks me so it won't notify me when it closes; clear ref now
+    [self clearDbRef];  // _db no longer tracks me so it won't notify me when it closes; clear ref now
+}
+
+
+// Called after a continuous replication has gone idle, but it failed to transfer some revisions
+// and so wants to try again in a minute. Should be overridden by subclasses.
+- (void) retry {
+}
+
+- (void) retryIfReady {
+    if (!_running)
+        return;
+
+    if (_online) {
+        LogTo(Sync, @"%@ RETRYING, to transfer missed revisions...", self);
+        _revisionsFailed = 0;
+        [NSObject cancelPreviousPerformRequestsWithTarget: self
+                                                 selector: @selector(retryIfReady) object: nil];
+        [self retry];
+    } else {
+        [self performSelector: @selector(retryIfReady) withObject: nil afterDelay: kRetryDelay];
+    }
 }
 
 
 - (BOOL) goOffline {
-    if (!_online || !_running)
+    if (!_online)
         return NO;
     LogTo(Sync, @"%@: Going offline", self);
     _online = NO;
+    [self stopRemoteRequests];
     [self postProgressChanged];
     return YES;
 }
 
 
 - (BOOL) goOnline {
-    if (_online || !_running)
+    if (_online)
         return NO;
     LogTo(Sync, @"%@: Going online", self);
     _online = YES;
-    
-    [_lastSequence release];
-    _lastSequence = nil;
-    self.error = nil;
 
-    [self fetchRemoteCheckpointDoc];
-    [self postProgressChanged];
+    if (_running) {
+        [_lastSequence release];
+        _lastSequence = nil;
+        self.error = nil;
+
+        [self fetchRemoteCheckpointDoc];
+        [self postProgressChanged];
+    }
     return YES;
 }
 
@@ -321,6 +356,29 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
 #endif
 
 
+- (void) updateActive {
+    BOOL active = _batcher.count > 0 || _asyncTaskCount > 0;
+    if (active != _active) {
+        self.active = active;
+        [self postProgressChanged];
+        if (!_active) {
+            // Replicator is now idle. If it's not continuous, stop.
+            if (!_continuous) {
+                [self stopped];
+            } else if (_revisionsFailed > 0) {
+                LogTo(Sync, @"%@: Failed to xfer %u revisions; will retry in %g sec",
+                      self, _revisionsFailed, kRetryDelay);
+                [NSObject cancelPreviousPerformRequestsWithTarget: self
+                                                         selector: @selector(retryIfReady)
+                                                           object: nil];
+                [self performSelector: @selector(retryIfReady)
+                           withObject: nil afterDelay: kRetryDelay];
+            }
+        }
+    }
+}
+
+
 - (void) asyncTaskStarted {
     if (_asyncTaskCount++ == 0)
         [self updateActive];
@@ -332,8 +390,6 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
     Assert(_asyncTaskCount >= 0);
     if (_asyncTaskCount == 0) {
         [self updateActive];
-        if (!_continuous)
-            [self stopped];
     }
 }
 
@@ -346,8 +402,25 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
 }
 
 
+- (void) addRevsToInbox: (TDRevisionList*)revs {
+    Assert(_running);
+    LogTo(SyncVerbose, @"%@: Received %llu revs", self, (UInt64)revs.count);
+    [_batcher queueObjects: revs.allRevisions];
+    [self updateActive];
+}
+
+
 - (void) processInbox: (NSArray*)inbox {
 }
+
+
+- (void) revisionFailed {
+    // Remember that some revisions failed to transfer, so we can later retry.
+    ++_revisionsFailed;
+}
+
+
+#pragma mark - HTTP REQUESTS:
 
 
 - (TDRemoteJSONRequest*) sendAsyncRequest: (NSString*)method
@@ -358,15 +431,53 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
     LogTo(SyncVerbose, @"%@: %@ .%@", self, method, relativePath);
     NSString* urlStr = [_remote.absoluteString stringByAppendingString: relativePath];
     NSURL* url = [NSURL URLWithString: urlStr];
-    TDRemoteJSONRequest *req = [[TDRemoteJSONRequest alloc] initWithMethod: method
+    onCompletion = [[onCompletion copy] autorelease];
+    __block TDRemoteJSONRequest *req = [[TDRemoteJSONRequest alloc] initWithMethod: method
                                                                         URL: url
                                                                        body: body
                                                              requestHeaders: self.requestHeaders 
-                                                              onCompletion: onCompletion];
+                                                              onCompletion:
+                                ^(id result, NSError* error) {
+                                    [self removeRemoteRequest: req];
+                                    onCompletion(result, error);
+                                }];
     req.authorizer = _authorizer;
+    [self addRemoteRequest: req];
     [req start];
     return [req autorelease];
 }
+
+
+- (void) addRemoteRequest: (TDRemoteRequest*)request {
+    if (!_remoteRequests)
+        _remoteRequests = [[NSMutableArray alloc] init];
+    [_remoteRequests addObject: request];
+}
+
+- (void) removeRemoteRequest: (TDRemoteRequest*)request {
+    [_remoteRequests removeObjectIdenticalTo: request];
+}
+
+
+- (void) stopRemoteRequests {
+    if (!_remoteRequests)
+        return;
+    LogTo(Sync, @"Stopping %u remote requests", (unsigned)_remoteRequests.count);
+    // Clear _remoteRequests before iterating, to ensure that re-entrant calls to this won't
+    // try to re-stop any of the requests. (Re-entrant calls are possible due to replicator
+    // error handling when it receives the 'canceled' errors from the requests I'm stopping.)
+    NSArray* requests = [_remoteRequests autorelease];
+    _remoteRequests = nil;
+    [requests makeObjectsPerformSelector: @selector(stop)];
+}
+
+
+- (NSArray*) activeRequestsStatus {
+    return [_remoteRequests my_map: ^id(TDRemoteRequest* request) {
+        return request.statusInfo;
+    }];
+}
+
 
 #pragma mark - CHECKPOINT STORAGE:
 
@@ -382,7 +493,7 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
 - (NSString*) remoteCheckpointDocID {
     NSMutableDictionary* spec = $mdict({@"localUUID", _db.privateUUID},
                                        {@"remoteURL", _remote.absoluteString},
-                                       {@"push", $object(self.isPush)},
+                                       {@"push", @(self.isPush)},
                                        {@"filter", _filterName},
                                        {@"filterParams", _filterParameters});
     return TDHexSHA1Digest([TDCanonicalJSON canonicalData: spec]);
@@ -409,7 +520,7 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
                       response = $castIf(NSDictionary, response);
                       self.remoteCheckpoint = response;
                       NSString* remoteLastSequence = $castIf(NSString,
-                                                        [response objectForKey: @"lastSequence"]);
+                                                        response[@"lastSequence"]);
 
                       if ($equal(remoteLastSequence, localLastSequence)) {
                           _lastSequence = [localLastSequence retain];
@@ -456,19 +567,17 @@ NSString* TDReplicatorStoppedNotification = @"TDReplicatorStopped";
                       body: body
               onCompletion: ^(id response, NSError* error) {
                   _savingCheckpoint = NO;
-                  if (!_db)
-                      return;   // db already closed
                   if (error) {
                       Warn(@"%@: Unable to save remote checkpoint: %@", self, error);
                       // TODO: If error is 401 or 403, and this is a pull, remember that remote is read-only and don't attempt to read its checkpoint next time.
-                  } else {
-                      id rev = [response objectForKey: @"rev"];
+                  } else if (_db) {
+                      id rev = response[@"rev"];
                       if (rev)
-                          [body setObject: rev forKey: @"_rev"];
+                          body[@"_rev"] = rev;
                       self.remoteCheckpoint = body;
                       [_db setLastSequence: _lastSequence withCheckpointID: checkpointID];
                   }
-                  if (_overdueForSave)
+                  if (_db && _overdueForSave)
                       [self saveLastSequence];      // start a save that was waiting on me
               }
      ];

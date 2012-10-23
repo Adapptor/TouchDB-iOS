@@ -96,7 +96,7 @@
     // Retaining myself shouldn't be necessary, because NSURLConnection is documented as retaining
     // its delegate while it's running. But GNUstep doesn't (currently) do this, so for
     // compatibility I retain myself until the connection completes (see -clearConnection.)
-    // TEMP: Remove this and the [self autorelease] below when I get the fix from GNUstep.
+    // TODO: Remove this and the [self autorelease] below when I get the fix from GNUstep.
     [self retain];
 }
 
@@ -125,6 +125,11 @@
 }
 
 
+- (NSMutableDictionary*) statusInfo {
+    return $mdict({@"URL", _request.URL.absoluteString}, {@"method", _request.HTTPMethod});
+}
+
+
 - (void) respondWithResult: (id)result error: (NSError*)error {
     Assert(result || error);
     _onCompletion(result, error);
@@ -136,6 +141,22 @@
     [_connection autorelease];
     _connection = nil;
     [self performSelector: @selector(start) withObject: nil afterDelay: delay];
+}
+
+
+- (void) stop {
+    if (_connection) {
+        LogTo(RemoteRequest, @"%@: Stopped", self);
+        [_connection cancel];
+    }
+    [self clearConnection];
+    if (_onCompletion) {
+        NSError* error = [NSError errorWithDomain: NSURLErrorDomain code: NSURLErrorCancelled
+                                         userInfo: nil];
+        [self respondWithResult: nil error: error];
+        [_onCompletion release];   // break cycles
+        _onCompletion = nil;
+    }
 }
 
 
@@ -199,6 +220,7 @@
                 return;
             }
         }
+        [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
     } else if ($equal(authMethod, NSURLAuthenticationMethodServerTrust)) {
         SecTrustRef trust = space.serverTrust;
         if ([[self class] checkTrust: trust forHost: space.host]) {
@@ -207,8 +229,9 @@
         } else {
             [sender cancelAuthenticationChallenge: challenge];
         }
+    } else {
+        [sender performDefaultHandlingForAuthenticationChallenge: challenge];
     }
-    [sender performDefaultHandlingForAuthenticationChallenge: challenge];
 }
 
 
@@ -232,8 +255,8 @@
         NSArray* trustProperties = NSMakeCollectable(SecTrustCopyProperties(trust));
         for (NSDictionary* property in trustProperties) {
             Warn(@"    %@: error = %@",
-                 [property objectForKey: kSecPropertyTypeTitle],
-                 [property objectForKey: kSecPropertyTypeError]);
+                 property[(id)kSecPropertyTypeTitle],
+                 property[(id)kSecPropertyTypeError]);
         }
         [trustProperties release];
 #endif
@@ -252,7 +275,22 @@
         if ([self retryWithCredential])
             return;
     }
-    if (TDStatusIsError(_status)) 
+    
+#if DEBUG
+    if (!TDStatusIsError(_status)) {
+        // By setting the user default "TDFakeFailureRate" to a number between 0.0 and 1.0,
+        // you can artificially cause failures of that fraction of requests, for testing.
+        // The status will be 567, or the value of "TDFakeFailureStatus" if it's set.
+        NSUserDefaults* dflts = [NSUserDefaults standardUserDefaults];
+        float fakeFailureRate = [dflts floatForKey: @"TDFakeFailureRate"];
+        if (fakeFailureRate > 0.0 && random() < fakeFailureRate * 0x7FFFFFFF) {
+            AlwaysLog(@"***FAKE FAILURE: %@", self);
+            _status = (int)[dflts integerForKey: @"TDFakeFailureStatus"] ?: 567;
+        }
+    }
+#endif
+    
+    if (TDStatusIsError(_status))
         [self cancelWithStatus: _status];
 }
 

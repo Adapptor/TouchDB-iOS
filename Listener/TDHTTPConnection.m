@@ -68,11 +68,12 @@
     urlRequest.HTTPBody = request.body;
     NSDictionary* headers = request.allHeaderFields;
     for (NSString* header in headers)
-        [urlRequest setValue: [headers objectForKey: header] forHTTPHeaderField: header];
+        [urlRequest setValue: headers[header] forHTTPHeaderField: header];
     
     // Create a TDRouter:
     TDRouter* router = [[TDRouter alloc] initWithServer: ((TDHTTPServer*)config.server).tdServer
-                                                request: urlRequest];
+                                                request: urlRequest
+                                                isLocal: NO];
     router.processRanges = NO;  // The HTTP server framework does this already
     TDHTTPResponse* response = [[[TDHTTPResponse alloc] initWithRouter: router
                                                          forConnection: self] autorelease];

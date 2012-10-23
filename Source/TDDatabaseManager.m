@@ -20,6 +20,9 @@
 #import "TDMisc.h"
 
 
+const TDDatabaseManagerOptions kTDDatabaseManagerDefaultOptions;
+
+
 @implementation TDDatabaseManager
 
 
@@ -41,7 +44,9 @@ static NSCharacterSet* kIllegalNameChars;
 + (TDDatabaseManager*) createEmptyAtPath: (NSString*)path {
     [[NSFileManager defaultManager] removeItemAtPath: path error: NULL];
     NSError* error;
-    TDDatabaseManager* dbm = [[self alloc] initWithDirectory: path error: &error];
+    TDDatabaseManager* dbm = [[self alloc] initWithDirectory: path
+                                                     options: NULL
+                                                       error: &error];
     Assert(dbm, @"Failed to create db manager at %@: %@", path, error);
     AssertEqual(dbm.directory, path);
     return [dbm autorelease];
@@ -53,12 +58,16 @@ static NSCharacterSet* kIllegalNameChars;
 #endif
 
 
-- (id) initWithDirectory: (NSString*)dirPath error: (NSError**)outError {
+- (id) initWithDirectory: (NSString*)dirPath
+                 options: (const TDDatabaseManagerOptions*)options
+                   error: (NSError**)outError
+{
     if (outError) *outError = nil;
     self = [super init];
     if (self) {
         _dir = [dirPath copy];
         _databases = [[NSMutableDictionary alloc] init];
+        _options = options ? *options : kTDDatabaseManagerDefaultOptions;
         
         // Create the directory but don't fail if it already exists:
         NSError* error;
@@ -109,18 +118,21 @@ static NSCharacterSet* kIllegalNameChars;
 
 
 - (TDDatabase*) databaseNamed: (NSString*)name create: (BOOL)create {
-    TDDatabase* db = [_databases objectForKey: name];
+    if (_options.readOnly)
+        create = NO;
+    TDDatabase* db = _databases[name];
     if (!db) {
         NSString* path = [self pathForName: name];
         if (!path)
             return nil;
         db = [[TDDatabase alloc] initWithPath: path];
+        db.readOnly = _options.readOnly;
         if (!create && !db.exists) {
             [db release];
             return nil;
         }
         db.name = name;
-        [_databases setObject: db forKey: name];
+        _databases[name] = db;
         [db release];
     }
     return db;
@@ -152,7 +164,7 @@ static NSCharacterSet* kIllegalNameChars;
 
 - (NSArray*) allDatabaseNames {
     NSArray* files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath: _dir error: NULL];
-    files = [files pathsMatchingExtensions: $array(kDBExtension)];
+    files = [files pathsMatchingExtensions: @[kDBExtension]];
     return [files my_map: ^(id filename) {
         return [[filename stringByDeletingPathExtension]
                                 stringByReplacingOccurrencesOfString: @":" withString: @"/"];
@@ -165,15 +177,6 @@ static NSCharacterSet* kIllegalNameChars;
 }
 
 
-- (TDReplicatorManager*) replicatorManager {
-    if (!_replicatorManager) {
-        _replicatorManager = [[TDReplicatorManager alloc] initWithDatabaseManager: self];
-        [_replicatorManager start];
-    }
-    return _replicatorManager;
-}
-
-
 - (void) close {
     LogTo(TDServer, @"CLOSE %@", self);
     [_replicatorManager stop];
@@ -183,6 +186,15 @@ static NSCharacterSet* kIllegalNameChars;
         [db close];
     }
     [_databases removeAllObjects];
+}
+
+
+- (TDReplicatorManager*) replicatorManager {
+    if (!_replicatorManager && !_options.noReplicator) {
+        _replicatorManager = [[TDReplicatorManager alloc] initWithDatabaseManager: self];
+        [_replicatorManager start];
+    }
+    return _replicatorManager;
 }
 
 
@@ -205,11 +217,11 @@ TestCase(TDDatabaseManager) {
     
     CAssertEq([dbm databaseNamed: @"foo"], db);
     
-    CAssertEqual(dbm.allDatabaseNames, $array());    // because foo doesn't exist yet
+    CAssertEqual(dbm.allDatabaseNames, @[]);    // because foo doesn't exist yet
     
     CAssert([db open]);
     CAssert(db.exists);
-    CAssertEqual(dbm.allDatabaseNames, $array(@"foo"));    // because foo doesn't exist yet
+    CAssertEqual(dbm.allDatabaseNames, @[@"foo"]);    // because foo doesn't exist yet
 }
 
 #endif

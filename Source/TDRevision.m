@@ -40,9 +40,9 @@
 
 - (id) initWithBody: (TDBody*)body {
     Assert(body);
-    self = [self initWithDocID: [body propertyForKey: @"_id"]
-                         revID: [body propertyForKey: @"_rev"]
-                       deleted: [body propertyForKey: @"_deleted"] == $true];
+    self = [self initWithDocID: body[@"_id"]
+                         revID: body[@"_rev"]
+                       deleted: body[@"_deleted"] == $true];
     if (self) {
         self.body = body;
     }
@@ -69,7 +69,8 @@
     [super dealloc];
 }
 
-@synthesize docID=_docID, revID=_revID, deleted=_deleted, body=_body, sequence=_sequence;
+@synthesize docID=_docID, revID=_revID, deleted=_deleted, missing=_missing,
+            body=_body, sequence=_sequence;
 
 - (unsigned) generation {
     return [[self class] generationFromRevID: _revID];
@@ -109,6 +110,10 @@
 
 - (void) setProperties:(NSDictionary *)properties {
     self.body = [TDBody bodyWithProperties: properties];
+}
+
+- (id)objectForKeyedSubscript:(id)key {
+    return [_body objectForKeyedSubscript: key];
 }
 
 - (NSData*) asJSON {
@@ -191,6 +196,10 @@
 }
 
 @synthesize allRevisions=_revs;
+
+- (TDRevision*) objectAtIndexedSubscript: (NSUInteger)index {
+    return _revs[index];
+}
 
 - (void) addRev: (TDRevision*)rev {
     [_revs addObject: rev];

@@ -30,8 +30,11 @@
 - (NSMutableDictionary*) documentPropertiesFromJSON: (NSData*)json
                                               docID: (NSString*)docID
                                               revID: (NSString*)revID
+                                            deleted: (BOOL)deleted
                                            sequence: (SequenceNumber)sequence
                                             options: (TDContentOptions)options;
+- (NSString*) winningRevIDOfDocNumericID: (SInt64)docNumericID
+                               isDeleted: (BOOL*)outIsDeleted;
 @end
 
 @interface TDDatabase (Insertion_Internal)
@@ -50,6 +53,7 @@
 - (TDStatus) copyAttachmentNamed: (NSString*)name
                     fromSequence: (SequenceNumber)fromSequence
                       toSequence: (SequenceNumber)toSequence;
+- (BOOL) inlineFollowingAttachmentsIn: (TDRevision*)rev error: (NSError**)outError;
 @end
 
 @interface TDDatabase (Replication_Internal)
@@ -97,15 +101,20 @@
 - (void) maybeCreateRemoteDB;
 - (void) beginReplicating;
 - (void) addToInbox: (TDRevision*)rev;
+- (void) addRevsToInbox: (TDRevisionList*)revs;
 - (void) processInbox: (TDRevisionList*)inbox;  // override this
 - (TDRemoteJSONRequest*) sendAsyncRequest: (NSString*)method
                                      path: (NSString*)relativePath
                                      body: (id)body
                              onCompletion: (TDRemoteRequestCompletionBlock)onCompletion;
+- (void) addRemoteRequest: (TDRemoteRequest*)request;
+- (void) removeRemoteRequest: (TDRemoteRequest*)request;
 - (void) asyncTaskStarted;
 - (void) asyncTasksFinished: (NSUInteger)numTasks;
 - (void) stopped;
 - (void) databaseClosing;
+- (void) revisionFailed;    // subclasses call this if a transfer fails
+- (void) retry;
 
 - (void) reachabilityChanged: (TDReachability*)host;
 - (BOOL) goOffline;

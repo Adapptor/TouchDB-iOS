@@ -113,8 +113,13 @@ static BOOL removeItemIfExists(NSString* path, NSError** outError) {
 - (BOOL) open {
     if (_open)
         return YES;
-    LogTo(TDDatabase, @"Open %@", _path);
-    if (![_fmdb open])
+    int flags = SQLITE_OPEN_FILEPROTECTION_COMPLETEUNLESSOPEN;
+    if (_readOnly)
+        flags |= SQLITE_OPEN_READONLY;
+    else
+        flags |= SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+    LogTo(TDDatabase, @"Open %@ (flags=%X)", _path, flags);
+    if (![_fmdb openWithFlags: flags])
         return NO;
     
     // Register CouchDB-compatible JSON collation functions:
@@ -323,7 +328,7 @@ static BOOL removeItemIfExists(NSString* path, NSError** outError) {
     [super dealloc];
 }
 
-@synthesize path=_path, name=_name, fmdb=_fmdb, attachmentStore=_attachments;
+@synthesize path=_path, name=_name, fmdb=_fmdb, attachmentStore=_attachments, readOnly=_readOnly;
 
 
 - (UInt64) totalDataSize {
@@ -420,18 +425,19 @@ static BOOL removeItemIfExists(NSString* path, NSError** outError) {
     //OPT: This probably ends up making redundant SQL queries if multiple options are enabled.
     id localSeq=nil, revs=nil, revsInfo=nil, conflicts=nil;
     if (options & kTDIncludeLocalSeq)
-        localSeq = $object(sequence);
-    
+        localSeq = @(sequence);
+
     if (options & kTDIncludeRevs) {
         revs = [self getRevisionHistoryDict: rev];
     }
     
     if (options & kTDIncludeRevsInfo) {
-        revsInfo = [[self getRevisionHistory: rev] my_map: ^id(id rev) {
+        revsInfo = [[self getRevisionHistory: rev] my_map: ^id(TDRevision* rev) {
             NSString* status = @"available";
-            if ([rev deleted])
+            if (rev.deleted)
                 status = @"deleted";
-            // TODO: Detect missing revisions, set status="missing"
+            else if (rev.missing)
+                status = @"missing";
             return $dict({@"rev", [rev revID]}, {@"status", status});
         }];
     }
@@ -440,7 +446,7 @@ static BOOL removeItemIfExists(NSString* path, NSError** outError) {
         TDRevisionList* revs = [self getAllRevisionsOfDocumentID: docID onlyCurrent: YES];
         if (revs.count > 1) {
             conflicts = [revs.allRevisions my_map: ^(id aRev) {
-                return $equal(aRev, rev) ? nil : [aRev revID];
+                return ($equal(aRev, rev) || [(TDRevision*)aRev deleted]) ? nil : [aRev revID];
             }];
         }
     }
@@ -463,28 +469,37 @@ static BOOL removeItemIfExists(NSString* path, NSError** outError) {
                   options: (TDContentOptions)options
 {
     NSDictionary* extra = [self extraPropertiesForRevision: rev options: options];
-    if (json.length > 0)
+    if (json.length > 0) {
         rev.asJSON = [TDJSON appendDictionary: extra toJSONDictionaryData: json];
-    else
+    } else {
         rev.properties = extra;
+        if (json == nil)
+            rev.missing = true;
+    }
 }
 
 
 - (NSDictionary*) documentPropertiesFromJSON: (NSData*)json
                                        docID: (NSString*)docID
                                        revID: (NSString*)revID
+                                     deleted: (BOOL)deleted
                                     sequence: (SequenceNumber)sequence
                                      options: (TDContentOptions)options
 {
-    TDRevision* rev = [[TDRevision alloc] initWithDocID: docID revID: revID deleted: NO];
+    TDRevision* rev = [[TDRevision alloc] initWithDocID: docID revID: revID deleted: deleted];
     rev.sequence = sequence;
+    rev.missing = (json == nil);
     NSDictionary* extra = [self extraPropertiesForRevision: rev options: options];
     [rev release];
-    if (json==nil || (json.length==2 && memcmp(json.bytes, "{}", 2)==0))
+    if (json.length == 0 || (json.length==2 && memcmp(json.bytes, "{}", 2)==0))
         return extra;      // optimization, and workaround for issue #44
     NSMutableDictionary* docProperties = [TDJSON JSONObjectWithData: json
                                                             options: TDJSONReadingMutableContainers
                                                               error: NULL];
+    if (!docProperties) {
+        Warn(@"Unparseable JSON for doc=%@, rev=%@: %@", docID, revID, [json my_UTF8ToString]);
+        return extra;
+    }
     [docProperties addEntriesFromDictionary: extra];
     return docProperties;
 }
@@ -493,6 +508,7 @@ static BOOL removeItemIfExists(NSString* path, NSError** outError) {
 - (TDRevision*) getDocumentWithID: (NSString*)docID
                        revisionID: (NSString*)revID
                           options: (TDContentOptions)options
+                           status: (TDStatus*)outStatus
 {
     TDRevision* result = nil;
     NSMutableString* sql = [NSMutableString stringWithString: @"SELECT revid, deleted, sequence"];
@@ -500,13 +516,20 @@ static BOOL removeItemIfExists(NSString* path, NSError** outError) {
         [sql appendString: @", json"];
     if (revID)
         [sql appendString: @" FROM revs, docs "
-               "WHERE docs.docid=? AND revs.doc_id=docs.doc_id AND revid=? LIMIT 1"];
+               "WHERE docs.docid=? AND revs.doc_id=docs.doc_id AND revid=? AND json notnull LIMIT 1"];
     else
         [sql appendString: @" FROM revs, docs "
                "WHERE docs.docid=? AND revs.doc_id=docs.doc_id and current=1 and deleted=0 "
                "ORDER BY revid DESC LIMIT 1"];
     FMResultSet *r = [_fmdb executeQuery: sql, docID, revID];
-    if ([r next]) {
+    if (!r) {
+        *outStatus = kTDStatusDBError;
+    } else if (![r next]) {
+        if (!revID && [self getDocNumericID: docID] > 0)
+            *outStatus = kTDStatusDeleted;
+        else
+            *outStatus = kTDStatusNotFound;
+    } else {
         if (!revID)
             revID = [r stringForColumnIndex: 0];
         BOOL deleted = [r boolForColumnIndex: 1];
@@ -519,14 +542,24 @@ static BOOL removeItemIfExists(NSString* path, NSError** outError) {
                 json = [r dataNoCopyForColumnIndex: 3];
             [self expandStoredJSON: json intoRevision: result options: options];
         }
+        *outStatus = kTDStatusOK;
     }
     [r close];
     return result;
 }
 
 
+- (TDRevision*) getDocumentWithID: (NSString*)docID
+                       revisionID: (NSString*)revID
+{
+    TDStatus status;
+    return [self getDocumentWithID: docID revisionID: revID options: 0 status: &status];
+}
+
+
 - (BOOL) existsDocumentWithID: (NSString*)docID revisionID: (NSString*)revID {
-    return [self getDocumentWithID: docID revisionID: revID options: kTDNoBody] != nil;
+    TDStatus status;
+    return [self getDocumentWithID: docID revisionID: revID options: kTDNoBody status: &status] != nil;
 }
 
 
@@ -573,7 +606,7 @@ static BOOL removeItemIfExists(NSString* path, NSError** outError) {
     else
         sql = @"SELECT sequence, revid, deleted FROM revs "
                "WHERE doc_id=? ORDER BY sequence DESC";
-    FMResultSet* r = [_fmdb executeQuery: sql, $object(docNumericID)];
+    FMResultSet* r = [_fmdb executeQuery: sql, @(docNumericID)];
     if (!r)
         return nil;
     TDRevisionList* revs = [[[TDRevisionList alloc] init] autorelease];
@@ -627,7 +660,7 @@ static NSArray* revIDsFromResultSet(FMResultSet* r) {
                       @"SELECT revid FROM revs WHERE doc_id=? and revid < ?"
                        " and deleted=0 and json not null"
                        " ORDER BY sequence DESC LIMIT ?",
-                      $object(docNumericID), $sprintf(@"%d-", generation), $object(sqlLimit)];
+                      @(docNumericID), $sprintf(@"%d-", generation), @(sqlLimit)];
     return revIDsFromResultSet(r);
 }
 
@@ -642,7 +675,7 @@ static NSArray* revIDsFromResultSet(FMResultSet* r) {
                               "WHERE doc_id=? and revid in (%@) and revid <= ? "
                               "ORDER BY revid DESC LIMIT 1", 
                               [TDDatabase joinQuotedStrings: revIDs]);
-    return [_fmdb stringForQuery: sql, $object(docNumericID), rev.revID];
+    return [_fmdb stringForQuery: sql, @(docNumericID), rev.revID];
 }
     
 
@@ -655,11 +688,11 @@ static NSArray* revIDsFromResultSet(FMResultSet* r) {
     if (docNumericID < 0)
         return nil;
     else if (docNumericID == 0)
-        return $array();
+        return @[];
     
-    FMResultSet* r = [_fmdb executeQuery: @"SELECT sequence, parent, revid, deleted FROM revs "
-                                           "WHERE doc_id=? ORDER BY sequence DESC",
-                                          $object(docNumericID)];
+    FMResultSet* r = [_fmdb executeQuery: @"SELECT sequence, parent, revid, deleted, json isnull "
+                                           "FROM revs WHERE doc_id=? ORDER BY sequence DESC",
+                                          @(docNumericID)];
     if (!r)
         return nil;
     SequenceNumber lastSequence = 0;
@@ -676,6 +709,7 @@ static NSArray* revIDsFromResultSet(FMResultSet* r) {
             BOOL deleted = [r boolForColumnIndex: 3];
             TDRevision* rev = [[TDRevision alloc] initWithDocID: docID revID: revID deleted: deleted];
             rev.sequence = sequence;
+            rev.missing = [r boolForColumnIndex: 4];
             [history addObject: rev];
             [rev release];
             lastSequence = [r longLongIntForColumnIndex: 1];
@@ -701,7 +735,7 @@ static NSDictionary* makeRevisionHistoryDict(NSArray* history) {
         NSString* suffix;
         if ([TDRevision parseRevID: rev.revID intoGeneration: &revNo andSuffix: &suffix]) {
             if (!start)
-                start = $object(revNo);
+                start = @(revNo);
             else if (revNo != lastRevNo - 1) {
                 start = nil;
                 break;
@@ -723,6 +757,34 @@ static NSDictionary* makeRevisionHistoryDict(NSArray* history) {
 }
 
 
+- (NSString*) getParentRevID: (TDRevision*)rev {
+    Assert(rev.sequence > 0);
+    return [_fmdb stringForQuery: @"SELECT parent.revid FROM revs, revs as parent"
+                                   " WHERE revs.sequence=? and parent.sequence=revs.parent",
+                                  @(rev.sequence)];
+}
+
+
+/** Returns the rev ID of the 'winning' revision of this document, and whether it's deleted. */
+- (NSString*) winningRevIDOfDocNumericID: (SInt64)docNumericID
+                               isDeleted: (BOOL*)outIsDeleted
+{
+    Assert(docNumericID > 0);
+    FMResultSet* r = [_fmdb executeQuery: @"SELECT revid, deleted FROM revs"
+                                           " WHERE doc_id=? and current=1"
+                                           " ORDER BY deleted asc, revid desc LIMIT 1",
+                                          @(docNumericID)];
+    NSString* revID = nil;
+    if ([r next]) {
+        revID = [r stringForColumnIndex: 0];
+        *outIsDeleted = [r boolForColumnIndex: 1];
+    } else {
+        *outIsDeleted = NO;
+    }
+    [r close];
+    return revID;
+}
+
 
 const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
 
@@ -730,6 +792,7 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
 - (TDRevisionList*) changesSinceSequence: (SequenceNumber)lastSequence
                                  options: (const TDChangesOptions*)options
                                   filter: (TDFilterBlock)filter
+                                  params: (NSDictionary*)filterParams
 {
     // http://wiki.apache.org/couchdb/HTTP_database_API#Changes
     if (!options) options = &kDefaultTDChangesOptions;
@@ -740,7 +803,7 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
                              "AND revs.doc_id = docs.doc_id "
                              "ORDER BY revs.doc_id, revid DESC",
                              (includeDocs ? @", json" : @""));
-    FMResultSet* r = [_fmdb executeQuery: sql, $object(lastSequence)];
+    FMResultSet* r = [_fmdb executeQuery: sql, @(lastSequence)];
     if (!r)
         return nil;
     TDRevisionList* changes = [[[TDRevisionList alloc] init] autorelease];
@@ -764,16 +827,17 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
                           intoRevision: rev
                                options: options->contentOptions];
             }
-            if (!filter || filter(rev))
+            if (!filter || filter(rev, filterParams))
                 [changes addRev: rev];
             [rev release];
         }
     }
     [r close];
     
-    if (options->sortBySequence)
+    if (options->sortBySequence) {
         [changes sortBySequence];
-    [changes limit: options->limit];
+        [changes limit: options->limit];
+    }
     return changes;
 }
 
@@ -785,7 +849,7 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
 }
 
 - (TDFilterBlock) filterNamed: (NSString*)filterName {
-    return [_filters objectForKey: filterName];
+    return _filters[filterName];
 }
 
 
@@ -797,13 +861,13 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
         return nil;
     if (!_views)
         _views = [[NSMutableDictionary alloc] init];
-    [_views setObject: view forKey: view.name];
+    _views[view.name] = view;
     return view;
 }
 
 
 - (TDView*) viewNamed: (NSString*)name {
-    TDView* view = [_views objectForKey: name];
+    TDView* view = _views[name];
     if (view)
         return view;
     return [self registerView: [[[TDView alloc] initWithDatabase: self name: name] autorelease]];
@@ -811,7 +875,7 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
 
 
 - (TDView*) existingViewNamed: (NSString*)name {
-    TDView* view = [_views objectForKey: name];
+    TDView* view = _views[name];
     if (view)
         return view;
     view = [[[TDView alloc] initWithDatabase: self name: name] autorelease];
@@ -851,15 +915,18 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
         update_seq = self.lastSequence;     // TODO: needs to be atomic with the following SELECT
     
     // Generate the SELECT statement, based on the options:
-    NSMutableString* sql = [NSMutableString stringWithFormat:
-                            @"SELECT revs.doc_id, docid, revid, deleted %@ FROM revs, docs WHERE",
-                             (options->includeDocs ? @", json, sequence" : @"")];
+    NSMutableString* sql = [[@"SELECT revs.doc_id, docid, revid" mutableCopy] autorelease];
+    if (options->includeDocs)
+        [sql appendString: @", json, sequence"];
+    if (options->includeDeletedDocs)
+        [sql appendString: @", deleted"];
+    [sql appendString: @" FROM revs, docs WHERE"];
     if (docIDs)
-        [sql appendFormat: @" docid IN (%@)", [TDDatabase joinQuotedStrings: docIDs]];
-    else
-        [sql appendString: @" deleted=0"];
-    [sql appendString: @" AND current=1 AND docs.doc_id = revs.doc_id"];
-    
+        [sql appendFormat: @" docid IN (%@) AND", [TDDatabase joinQuotedStrings: docIDs]];
+    [sql appendString: @" docs.doc_id = revs.doc_id AND current=1"];
+    if (!options->includeDeletedDocs)
+        [sql appendString: @" AND deleted=0"];
+
     NSMutableArray* args = $marray();
     id minKey = options->startKey, maxKey = options->endKey;
     BOOL inclusiveMin = YES, inclusiveMax = options->inclusiveEnd;
@@ -880,10 +947,11 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
         [args addObject: maxKey];
     }
     
-    [sql appendFormat: @" ORDER BY docid %@, revid DESC LIMIT ? OFFSET ?",
-                       (options->descending ? @"DESC" : @"ASC")];
-    [args addObject: $object(options->limit)];
-    [args addObject: $object(options->skip)];
+    [sql appendFormat: @" ORDER BY docid %@, %@ revid DESC LIMIT ? OFFSET ?",
+                       (options->descending ? @"DESC" : @"ASC"),
+                       (options->includeDeletedDocs ? @"deleted ASC," : @"")];
+    [args addObject: @(options->limit)];
+    [args addObject: @(options->skip)];
     
     // Now run the database query:
     FMResultSet* r = [_fmdb executeQuery: sql withArgumentsInArray: args];
@@ -892,6 +960,7 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
     
     int64_t lastDocID = 0;
     NSMutableArray* rows = $marray();
+    NSMutableDictionary* docs = docIDs ? $mdict() : nil;
     while ([r next]) {
         @autoreleasepool {
             // Only count the first rev for a given doc (the rest will be losing conflicts):
@@ -902,32 +971,63 @@ const TDChangesOptions kDefaultTDChangesOptions = {UINT_MAX, 0, NO, NO, YES};
             
             NSString* docID = [r stringForColumnIndex: 1];
             NSString* revID = [r stringForColumnIndex: 2];
-            BOOL deleted = [r boolForColumnIndex: 3];
+            BOOL deleted = options->includeDeletedDocs && [r boolForColumn: @"deleted"];
             NSDictionary* docContents = nil;
-            if (options->includeDocs && !deleted) {
+            if (options->includeDocs) {
                 // Fill in the document contents:
-                NSData* json = [r dataNoCopyForColumnIndex: 4];
-                SequenceNumber sequence = [r longLongIntForColumnIndex: 5];
+                NSData* json = [r dataNoCopyForColumnIndex: 3];
+                SequenceNumber sequence = [r longLongIntForColumnIndex: 4];
                 docContents = [self documentPropertiesFromJSON: json
                                                          docID: docID
                                                          revID: revID
+                                                       deleted: deleted
                                                       sequence: sequence
                                                        options: options->content];
+                Assert(docContents);
             }
             NSDictionary* change = $dict({@"id",  docID},
                                          {@"key", docID},
                                          {@"value", $dict({@"rev", revID},
-                                                          {@"deleted", (deleted ? $true : nil)})},
+                                                          {@"deleted", (deleted ?$true : nil)})},
                                          {@"doc", docContents});
-            [rows addObject: change];
+            if (docIDs)
+                [docs setObject: change forKey: docID];
+            else
+                [rows addObject: change];
         }
     }
     [r close];
+
+    // If given doc IDs, sort the output into that order, and add entries for missing docs:
+    if (docIDs) {
+        for (NSString* docID in docIDs) {
+            NSDictionary* change = docs[docID];
+            if (!change) {
+                NSString* revID = nil;
+                SInt64 docNumericID = [self getDocNumericID: docID];
+                if (docNumericID > 0) {
+                    BOOL deleted;
+                    revID = [self winningRevIDOfDocNumericID: docNumericID
+                                                   isDeleted: &deleted];
+                }
+                if (revID) {
+                    change = $dict({@"id",  docID},
+                                   {@"key", docID},
+                                   {@"value", $dict({@"rev", revID}, {@"deleted", $true})});
+                } else {
+                    change = $dict({@"key", docID},
+                                   {@"error", @"not_found"});
+                }
+            }
+            [rows addObject: change];
+        }
+    }
+
     NSUInteger totalRows = rows.count;      //??? Is this true, or does it ignore limit/offset?
-    return $dict({@"rows", $object(rows)},
-                 {@"total_rows", $object(totalRows)},
-                 {@"offset", $object(options->skip)},
-                 {@"update_seq", update_seq ? $object(update_seq) : nil});
+    return $dict({@"rows", rows},
+                 {@"total_rows", @(totalRows)},
+                 {@"offset", @(options->skip)},
+                 {@"update_seq", update_seq ? @(update_seq) : nil});
 }
 
 
@@ -949,15 +1049,15 @@ static TDRevision* mkrev(NSString* revID) {
 
 
 TestCase(TDDatabase_MakeRevisionHistoryDict) {
-    NSArray* revs = $array(mkrev(@"4-jkl"), mkrev(@"3-ghi"), mkrev(@"2-def"));
-    CAssertEqual(makeRevisionHistoryDict(revs), $dict({@"ids", $array(@"jkl", @"ghi", @"def")},
-                                                      {@"start", $object(4)}));
+    NSArray* revs = @[mkrev(@"4-jkl"), mkrev(@"3-ghi"), mkrev(@"2-def")];
+    CAssertEqual(makeRevisionHistoryDict(revs), $dict({@"ids", @[@"jkl", @"ghi", @"def"]},
+                                                      {@"start", @4}));
     
-    revs = $array(mkrev(@"4-jkl"), mkrev(@"2-def"));
-    CAssertEqual(makeRevisionHistoryDict(revs), $dict({@"ids", $array(@"4-jkl", @"2-def")}));
+    revs = @[mkrev(@"4-jkl"), mkrev(@"2-def")];
+    CAssertEqual(makeRevisionHistoryDict(revs), $dict({@"ids", @[@"4-jkl", @"2-def"]}));
     
-    revs = $array(mkrev(@"12345"), mkrev(@"6789"));
-    CAssertEqual(makeRevisionHistoryDict(revs), $dict({@"ids", $array(@"12345", @"6789")}));
+    revs = @[mkrev(@"12345"), mkrev(@"6789")];
+    CAssertEqual(makeRevisionHistoryDict(revs), $dict({@"ids", @[@"12345", @"6789"]}));
 }
 
 #endif
