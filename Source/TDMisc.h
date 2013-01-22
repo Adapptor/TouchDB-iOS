@@ -7,7 +7,7 @@
 //
 
 #import <Foundation/Foundation.h>
-#import <TouchDB/TDRevision.h>
+#import <TouchDB/TD_Revision.h>
 
 extern NSString* const TDHTTPErrorDomain;
 
@@ -54,3 +54,6 @@ BOOL TDIsFileExistsError( NSError* error );
 
 /** Returns the input URL without the query string or fragment identifier, just ending with the path. */
 NSURL* TDURLWithoutQuery( NSURL* url );
+
+/** Appends path components to a URL. These will NOT be URL-escaped, so you can include queries. */
+NSURL* TDAppendToURL(NSURL* baseURL, NSString* toAppend);

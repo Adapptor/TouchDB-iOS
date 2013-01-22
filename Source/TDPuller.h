@@ -7,7 +7,7 @@
 //
 
 #import "TDReplicator.h"
-#import <TouchDB/TDRevision.h>
+#import <TouchDB/TD_Revision.h>
 @class TDChangeTracker, TDSequenceMap;
 
 
@@ -30,14 +30,14 @@
 
 
 /** A revision received from a remote server during a pull. Tracks the opaque remote sequence ID. */
-@interface TDPulledRevision : TDRevision
+@interface TDPulledRevision : TD_Revision
 {
 @private
-    NSString* _remoteSequenceID;
+    id _remoteSequenceID;
     bool _conflicted;
 }
 
-@property (copy) NSString* remoteSequenceID;
+@property (copy) id remoteSequenceID;
 @property bool conflicted;
 
 @end

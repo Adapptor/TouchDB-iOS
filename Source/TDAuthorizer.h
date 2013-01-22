@@ -17,6 +17,14 @@
 - (NSString*) authorizeURLRequest: (NSMutableURLRequest*)request
                          forRealm: (NSString*)realm;
 
+- (NSString*) authorizeHTTPMessage: (CFHTTPMessageRef)message
+                          forRealm: (NSString*)realm;
+
+@optional
+
+@property (readonly) NSString* loginPath;
+- (NSDictionary*) loginParametersForSite: (NSURL*)site;
+
 @end
 
 
@@ -30,6 +38,10 @@
 
 /** Initialize given a credential object that contains a username and password. */
 - (id) initWithCredential: (NSURLCredential*)credential;
+
+/** Initialize given a URL alone -- will use a baked-in username/password in the URL,
+    or look up a credential from the keychain. */
+- (id)initWithURL: (NSURL*)url;
 
 @end
 
