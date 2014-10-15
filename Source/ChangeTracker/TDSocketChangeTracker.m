@@ -45,7 +45,7 @@
                                                           (__bridge CFURLRef)url,
                                                           kCFHTTPVersion1_1);
     Assert(request);
-    
+
     // Add headers from my .requestHeaders property:
     [self.requestHeaders enumerateKeysAndObjectsUsingBlock: ^(id key, id value, BOOL *stop) {
         CFHTTPMessageSetHeaderFieldValue(request, (__bridge CFStringRef)key, (__bridge CFStringRef)value);
@@ -98,7 +98,7 @@
     CFRelease(request);
     if (!cfInputStream)
         return NO;
-    
+
     CFReadStreamSetProperty(cfInputStream, kCFStreamPropertyHTTPShouldAutoredirect, kCFBooleanTrue);
 
     // Configure HTTP proxy -- CFNetwork makes us do this manually, unlike NSURLConnection :-p
@@ -115,21 +115,22 @@
         CFRelease(proxySettings);
     }
 
-    if (_databaseURL.my_isHTTPS) {
-        // Enable SSL for this connection.
-        // Disable TLS 1.2 support because it breaks compatibility with some SSL servers;
-        // workaround taken from Apple technote TN2287:
-        // http://developer.apple.com/library/ios/#technotes/tn2287/
-        NSDictionary *settings = $dict({(id)kCFStreamSSLLevel,
-                                        @"kCFStreamSocketSecurityLevelTLSv1_0SSLv3"});
-        CFReadStreamSetProperty(cfInputStream,
-                                kCFStreamPropertySSLSettings, (CFTypeRef)settings);
-    }
-    
+    // Our server should have no problem with tlsv1.2
+    // if (_databaseURL.my_isHTTPS) {
+    //     // Enable SSL for this connection.
+    //     // Disable TLS 1.2 support because it breaks compatibility with some SSL servers;
+    //     // workaround taken from Apple technote TN2287:
+    //     // http://developer.apple.com/library/ios/#technotes/tn2287/
+    //     NSDictionary *settings = $dict({(id)kCFStreamSSLLevel,
+    //                                     @"kCFStreamSocketSecurityLevelTLSv1_0SSLv3"});
+    //     CFReadStreamSetProperty(cfInputStream,
+    //                             kCFStreamPropertySSLSettings, (CFTypeRef)settings);
+    // }
+
     _gotResponseHeaders = _atEOF = _inputAvailable = _parsing = false;
-    
+
     _inputBuffer = [[NSMutableData alloc] initWithCapacity: kReadLength];
-    
+
     _trackingInput = (NSInputStream*)CFBridgingRelease(cfInputStream);
     [_trackingInput setDelegate: self];
     [_trackingInput scheduleInRunLoop: [NSRunLoop currentRunLoop] forMode: NSRunLoopCommonModes];
@@ -198,7 +199,7 @@
 - (NSURLCredential*) credentialForAuthHeader: (NSString*)authHeader {
     NSString* realm;
     NSString* authenticationMethod;
-    
+
     // Basic & digest auth: http://www.ietf.org/rfc/rfc2617.txt
     if (!authHeader)
         return nil;
@@ -210,7 +211,7 @@
         authenticationMethod = NSURLAuthenticationMethodHTTPDigest;
     else
         return nil;
-    
+
     // Get the realm:
     NSRange r = [authHeader rangeOfString: @"realm=\""];
     if (r.length == 0)
@@ -221,7 +222,7 @@
     if (r.length == 0)
         return nil;
     realm = [authHeader substringWithRange: NSMakeRange(start, r.location - start)];
-    
+
     NSURLCredential* cred;
     cred = [_databaseURL my_credentialForRealm: realm authenticationMethod: authenticationMethod];
     if (!cred.hasPassword)
@@ -292,7 +293,7 @@
         // ran out of changes due to a _limit rather than because we hit the end.
         restart = _mode == kLongPoll || numChanges == (NSInteger)_limit;
     }
-    
+
     [self clearConnection];
 
     if (restart)
@@ -314,7 +315,7 @@
         Warn(@"%@: Unparseable response:\n%@", self, bodyStr);
         return NO;
     }
-    
+
     // The response at least starts out as what we'd expect, so it looks like the connection was
     // closed unexpectedly before the full response was sent.
     NSTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - _startTime;
@@ -354,11 +355,11 @@
             [changes addObject: [NSData dataWithBytes: pos length: lineLength]];
         pos = eol + 1;
     }
-    
+
     // Remove the parsed lines:
     [_inputBuffer replaceBytesInRange: NSMakeRange(0, pos - (const char*)_inputBuffer.bytes)
                             withBytes: NULL length: 0];
-    
+
     if (changes.count > 0)
         [self asyncParseChangeLines: changes];
 }
@@ -368,7 +369,7 @@
     static NSOperationQueue* sParseQueue;
     if (!sParseQueue)
         sParseQueue = [[NSOperationQueue alloc] init];
-    
+
     LogTo(ChangeTracker, @"%@: Async parsing %u changes...", self, (unsigned)lines.count);
     Assert(!_parsing);
     _parsing = true;
@@ -395,7 +396,7 @@
                 [self setUpstreamError: @"Unparseable change line"];
                 [self stop];
             }
-            
+
             // Read more data if there is any, or stop if stream's at EOF:
             if (_inputAvailable)
                 [self readFromInput];
@@ -421,7 +422,7 @@
     Assert(!_parsing);
     Assert(_inputAvailable);
     _inputAvailable = false;
-    
+
     uint8_t buffer[kReadLength];
     NSInteger bytesRead = [_trackingInput read: buffer maxLength: sizeof(buffer)];
     if (bytesRead > 0)
@@ -473,7 +474,7 @@
                 [self readFromInput];
             break;
         }
-            
+
         case NSStreamEventEndEncountered:
             LogTo(ChangeTracker, @"%@: EndEncountered %@", self, stream);
             _atEOF = true;
@@ -490,11 +491,11 @@
                 [self readEntireInput];
             }
             break;
-            
+
         case NSStreamEventErrorOccurred:
             [self errorOccurred: stream.streamError];
             break;
-            
+
         default:
             LogTo(ChangeTracker, @"%@: Event %lx on %@", self, (long)eventCode, stream);
             break;
