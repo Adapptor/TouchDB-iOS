@@ -70,6 +70,12 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     }
     if (!_pendingSequences) {
         _pendingSequences = [[TDSequenceMap alloc] init];
+        if (_lastSequence != nil) {
+            // Prime _pendingSequences so its checkpointedValue will reflect the last known seq:
+            SequenceNumber seq = [_pendingSequences addValue: _lastSequence];
+            [_pendingSequences removeSequence: seq];
+            AssertEqual(_pendingSequences.checkpointedValue, _lastSequence);
+        }
     }
     
     _caughtUp = NO;
@@ -92,6 +98,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     _changeTracker.limit = kChangesFeedLimit;
     _changeTracker.filterName = _filterName;
     _changeTracker.filterParameters = _filterParameters;
+    _changeTracker.docIDs = _docIDs;
     _changeTracker.authorizer = _authorizer;
     unsigned heartbeat = $castIf(NSNumber, _options[@"heartbeat"]).unsignedIntValue;
     if (heartbeat >= 15000)
@@ -192,6 +199,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
                     rev.remoteSequenceID = remoteSequenceID;
                     if (changes.count > 1)
                         rev.conflicted = true;
+                    LogTo(SyncVerbose, @"%@: Received #%@ %@", self, remoteSequenceID, rev);
                     [self addToInbox: rev];
 
                     changeCount++;
@@ -357,12 +365,12 @@ static NSString* joinQuotedEscaped(NSArray* strings);
     // Under ARC, using variable dl directly in the block given as an argument to initWithURL:...
     // results in compiler error (could be undefined variable)
     __weak TDPuller *weakSelf = self;
-    __block TDMultipartDownloader *dl = nil;
+    TDMultipartDownloader *dl;
     dl = [[TDMultipartDownloader alloc] initWithURL: TDAppendToURL(_remote, path)
                                            database: _db
                                      requestHeaders: self.requestHeaders
                                        onCompletion:
-        ^(TDMultipartDownloader* download, NSError *error) {
+        ^(TDMultipartDownloader* dl, NSError *error) {
             __strong TDPuller *strongSelf = weakSelf;
             // OK, now we've got the response revision:
             if (error) {
@@ -370,7 +378,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
                 [strongSelf revisionFailed];
                 strongSelf.changesProcessed++;
             } else {
-                TD_Revision* gotRev = [TD_Revision revisionWithProperties: download.document];
+                TD_Revision* gotRev = [TD_Revision revisionWithProperties: dl.document];
                 gotRev.sequence = rev.sequence;
                 // Add to batcher ... eventually it will be fed to -insertRevisions:.
                 [_downloadsToInsert queueObject: gotRev];
@@ -386,6 +394,7 @@ static NSString* joinQuotedEscaped(NSArray* strings);
         }
      ];
     [self addRemoteRequest: dl];
+    dl.timeoutInterval = self.requestTimeout;
     dl.authorizer = _authorizer;
     [dl start];
 }

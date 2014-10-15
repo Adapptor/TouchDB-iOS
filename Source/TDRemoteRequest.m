@@ -65,6 +65,15 @@
 }
 
 
+- (NSTimeInterval) timeoutInterval {
+    return _request.timeoutInterval;
+}
+
+- (void) setTimeoutInterval:(NSTimeInterval)timeout {
+    _request.timeoutInterval = timeout;
+}
+
+
 - (id<TDAuthorizer>) authorizer {
     return _authorizer;
 }
@@ -135,6 +144,7 @@
 - (void) respondWithResult: (id)result error: (NSError*)error {
     Assert(result || error);
     _onCompletion(result, error);
+    _onCompletion = nil;  // break cycles
 }
 
 
@@ -155,8 +165,7 @@
         NSError* error = [NSError errorWithDomain: NSURLErrorDomain code: NSURLErrorCancelled
                                          userInfo: nil];
         [self respondWithResult: nil error: error];
-           // break cycles
-        _onCompletion = nil;
+        _onCompletion = nil;  // break cycles
     }
 }
 
@@ -210,27 +219,41 @@
     id<NSURLAuthenticationChallengeSender> sender = challenge.sender;
     NSURLProtectionSpace* space = challenge.protectionSpace;
     NSString* authMethod = space.authenticationMethod;
-    LogTo(RemoteRequest, @"Got challenge: %@ (%@)", challenge, authMethod);
-    if ($equal(authMethod, NSURLAuthenticationMethodHTTPBasic)) {
+    LogTo(RemoteRequest, @"Got challenge for %@: method=%@, proposed=%@, err=%@", self, authMethod, challenge.proposedCredential, challenge.error);
+    if ($equal(authMethod, NSURLAuthenticationMethodHTTPBasic) ||
+            $equal(authMethod, NSURLAuthenticationMethodHTTPDigest)) {
         _challenged = true;
-        if (!_authorizer && challenge.previousFailureCount == 0) {
-            NSURLCredential* cred = [_request.URL my_credentialForRealm: space.realm
-                                                   authenticationMethod: authMethod];
+        _authorizer = nil;
+        if (challenge.previousFailureCount <= 1) {
+            // On basic auth challenge, use proposed credential on first attempt. On second attempt
+            // or if there's no proposed credential, look one up. After that, give up.
+            NSURLCredential* cred = challenge.proposedCredential;
+            if (cred == nil || challenge.previousFailureCount > 0) {
+                cred = [_request.URL my_credentialForRealm: space.realm
+                                      authenticationMethod: authMethod];
+            }
             if (cred) {
+                LogTo(RemoteRequest, @"    challenge: useCredential: %@", cred);
                 [sender useCredential: cred forAuthenticationChallenge:challenge];
+                // Update my authorizer so my owner (the replicator) can pick it up when I'm done
+                _authorizer = [[TDBasicAuthorizer alloc] initWithCredential: cred];
                 return;
             }
         }
+        LogTo(RemoteRequest, @"    challenge: continueWithoutCredential");
         [sender continueWithoutCredentialForAuthenticationChallenge: challenge];
     } else if ($equal(authMethod, NSURLAuthenticationMethodServerTrust)) {
         SecTrustRef trust = space.serverTrust;
         if ([[self class] checkTrust: trust forHost: space.host]) {
+            LogTo(RemoteRequest, @"    useCredential for trust: %@", trust);
             [sender useCredential: [NSURLCredential credentialForTrust: trust]
                     forAuthenticationChallenge: challenge];
         } else {
+            LogTo(RemoteRequest, @"    challenge: cancel");
             [sender cancelAuthenticationChallenge: challenge];
         }
     } else {
+        LogTo(RemoteRequest, @"    challenge: performDefaultHandling");
         [sender performDefaultHandlingForAuthenticationChallenge: challenge];
     }
 }

@@ -39,6 +39,7 @@
 @synthesize limit=_limit, heartbeat=_heartbeat, error=_error;
 @synthesize client=_client, filterName=_filterName, filterParameters=_filterParameters;
 @synthesize requestHeaders = _requestHeaders, authorizer=_authorizer;
+@synthesize docIDs = _docIDs;
 
 - (id)initWithDatabaseURL: (NSURL*)databaseURL
                      mode: (TDChangeTrackerMode)mode
@@ -90,9 +91,35 @@
     if (_filterName) {
         [path appendFormat: @"&filter=%@", TDEscapeURLParam(_filterName)];
         for (NSString* key in _filterParameters) {
-            id value = _filterParameters[key];
+            NSString* value = _filterParameters[key];
+            if (![value isKindOfClass: [NSString class]]) {
+                // It's ambiguous whether non-string filter params are allowed.
+                // If we get one, encode it as JSON:
+                NSError* error;
+                value = [TDJSON stringWithJSONObject: value options: TDJSONWritingAllowFragments
+                                               error: &error];
+                if (!value) {
+                    Warn(@"Illegal filter parameter %@ = %@", key, _filterParameters[key]);
+                    continue;
+                }
+            }
             [path appendFormat: @"&%@=%@", TDEscapeURLParam(key),
-                                           TDEscapeURLParam([value description])];
+                                           TDEscapeURLParam(value)];
+        }
+    }
+
+    if (_docIDs) {
+
+        if (_filterName) {
+            Warn(@"You can't set both a replication filter and doc_ids, since doc_ids uses the internal _doc_ids filter.");
+        } else {
+            NSError *error;
+            NSString *docIDsParam = [TDJSON stringWithJSONObject: _docIDs options: TDJSONWritingAllowFragments
+                                                           error: &error];
+            if (!docIDsParam || error) {
+                Warn(@"Illegal doc IDs %@, %@", [_docIDs description], [error localizedDescription]);
+            }
+            [path appendFormat:@"&filter=_doc_ids&doc_ids=%@", TDEscapeURLParam(docIDsParam)];
         }
     }
 

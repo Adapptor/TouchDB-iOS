@@ -27,7 +27,7 @@
 
 #define kMaxRetries 6
 #define kInitialRetryDelay 0.2
-#define kReadLength 8192u
+#define kReadLength 4096u
 
 
 @implementation TDSocketChangeTracker
@@ -68,7 +68,8 @@
             // .hasPassword when setting _credential earlier. (See #195.) Keychain bug??
             // If this happens, try looking up the credential again:
             LogTo(ChangeTracker, @"Huh, couldn't get password of %@; trying again", _credential);
-            _credential = [self credentialForResponse: _unauthResponse];
+            _credential = [self credentialForAuthHeader:
+                                                [self authHeaderForResponse: _unauthResponse]];
             password = _credential.password;
         }
         if (password) {
@@ -92,11 +93,28 @@
     }
 
     // Now open the connection:
+    LogTo(SyncVerbose, @"%@: GET %@", self, url.resourceSpecifier);
     CFReadStreamRef cfInputStream = CFReadStreamCreateForHTTPRequest(NULL, request);
     CFRelease(request);
     if (!cfInputStream)
         return NO;
+    
     CFReadStreamSetProperty(cfInputStream, kCFStreamPropertyHTTPShouldAutoredirect, kCFBooleanTrue);
+
+    // Configure HTTP proxy -- CFNetwork makes us do this manually, unlike NSURLConnection :-p
+    CFDictionaryRef proxySettings = CFNetworkCopySystemProxySettings();
+    if (proxySettings) {
+        CFArrayRef proxies = CFNetworkCopyProxiesForURL((__bridge CFURLRef)url, proxySettings);
+        if (CFArrayGetCount(proxies) > 0) {
+            CFTypeRef proxy = CFArrayGetValueAtIndex(proxies, 0);
+            LogTo(ChangeTracker, @"Changes feed using proxy %@", proxy);
+            bool ok = CFReadStreamSetProperty(cfInputStream, kCFStreamPropertyHTTPProxy, proxy);
+            Assert(ok);
+            CFRelease(proxies);
+        }
+        CFRelease(proxySettings);
+    }
+
     if (_databaseURL.my_isHTTPS) {
         // Enable SSL for this connection.
         // Disable TLS 1.2 support because it breaks compatibility with some SSL servers;
@@ -124,6 +142,7 @@
 
 - (void) clearConnection {
     [_trackingInput close];
+    [_trackingInput removeFromRunLoop: [NSRunLoop currentRunLoop] forMode: NSRunLoopCommonModes];
     _trackingInput = nil;
     _inputBuffer = nil;
     _changeBuffer = nil;
@@ -170,16 +189,20 @@
 }
 
 
-- (NSURLCredential*) credentialForResponse: (CFHTTPMessageRef)response {
+- (NSString*) authHeaderForResponse: (CFHTTPMessageRef)response {
+    return CFBridgingRelease(CFHTTPMessageCopyHeaderFieldValue(response,
+                                                               CFSTR("WWW-Authenticate")));
+}
+
+
+- (NSURLCredential*) credentialForAuthHeader: (NSString*)authHeader {
     NSString* realm;
     NSString* authenticationMethod;
     
     // Basic & digest auth: http://www.ietf.org/rfc/rfc2617.txt
-    NSString* authHeader = CFBridgingRelease(CFHTTPMessageCopyHeaderFieldValue(response,
-                                                                       CFSTR("WWW-Authenticate")));
     if (!authHeader)
         return nil;
-    
+
     // Get the auth type:
     if ([authHeader hasPrefix: @"Basic"])
         authenticationMethod = NSURLAuthenticationMethodHTTPBasic;
@@ -213,25 +236,33 @@
                                                            kCFStreamPropertyHTTPResponseHeader);
     Assert(response);
     _gotResponseHeaders = true;
+    NSDictionary* errorInfo = nil;
 
     // Handle authentication failure (401 or 407 status):
     CFIndex status = CFHTTPMessageGetResponseStatusCode(response);
     LogTo(ChangeTracker, @"%@ got status %ld", self, status);
-    if ((status == 401 || status == 407) && !_credential
-                                         && ![_requestHeaders objectForKey: @"Authorization"]) {
-        _credential = [self credentialForResponse: response];
-        LogTo(ChangeTracker, @"%@: Auth challenge; credential = %@", self, _credential);
-        if (_credential) {
-            // Recoverable auth failure -- try again with _credential:
-            _unauthResponse = response;
-            [self errorOccurred: TDStatusToNSError((TDStatus)status, self.changesFeedURL)];
-            return NO;
+    if (status == 401 || status == 407) {
+        NSString* authorization = [_requestHeaders objectForKey: @"Authorization"];
+        NSString* authResponse = [self authHeaderForResponse: response];
+        if (!_credential && !authorization) {
+            _credential = [self credentialForAuthHeader: authResponse];
+            LogTo(ChangeTracker, @"%@: Auth challenge; credential = %@", self, _credential);
+            if (_credential) {
+                // Recoverable auth failure -- close socket but try again with _credential:
+                _unauthResponse = response;
+                [self errorOccurred: TDStatusToNSError((TDStatus)status, self.changesFeedURL)];
+                return NO;
+            }
         }
+        Log(@"%@: HTTP auth failed; sent Authorization: %@  ;  got WWW-Authenticate: %@",
+            self, authorization, authResponse);
+        errorInfo = $dict({@"HTTPAuthorization", authorization},
+                          {@"HTTPAuthenticateHeader", authResponse});
     }
 
     CFRelease(response);
     if (status >= 300) {
-        self.error = TDStatusToNSError(status, self.changesFeedURL);
+        self.error = TDStatusToNSErrorWithInfo(status, self.changesFeedURL, errorInfo);
         [self stop];
         return NO;
     }
@@ -251,10 +282,11 @@
     NSString* errorMessage = nil;
     NSInteger numChanges = [self receivedPollResponse: input errorMessage: &errorMessage];
     if (numChanges < 0) {
-        // Oops, unparseable response:
-        restart = [self checkInvalidResponse: input];
-        if (!restart)
-            [self setUpstreamError: errorMessage];
+        // Oops, unparseable response. See if it gets special handling:
+        if ([self handleInvalidResponse: input])
+            return;
+        // Otherwise report an upstream unparseable-response error
+        [self setUpstreamError: errorMessage];
     } else {
         // Poll again if there was no error, and either we're in longpoll mode or it looks like we
         // ran out of changes due to a _limit rather than because we hit the end.
@@ -270,25 +302,38 @@
 }
 
 
-- (BOOL) checkInvalidResponse: (NSData*)body {
-    NSString* bodyStr = [[body my_UTF8ToString] stringByTrimmingCharactersInSet:
-                                              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (_mode == kLongPoll && $equal(bodyStr, @"{\"results\":[")) {
-        // Looks like the connection got closed by a proxy (like AWS' load balancer) before
-        // the server had an actual change to send.
-        NSTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - _startTime;
-        Warn(@"%@: Longpoll connection closed (by proxy?) after %.1f sec", self, elapsed);
-        if (elapsed >= 30.0) {
-            self.heartbeat = MIN(_heartbeat, elapsed * 0.75);
-            return YES;  // should restart connection
-        }
-    } else if (bodyStr) {
+- (BOOL) handleInvalidResponse: (NSData*)body {
+    // Convert to string:
+    NSString* bodyStr = [body my_UTF8ToString];
+    if (!bodyStr) // (in case it was truncated in the middle of a UTF-8 character sequence)
+        bodyStr = [[NSString alloc] initWithData: body encoding: NSWindowsCP1252StringEncoding];
+    bodyStr = [bodyStr  stringByTrimmingCharactersInSet:
+               [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    if (_mode != kLongPoll || ![bodyStr hasPrefix: @"{\"results\":["] ) {
         Warn(@"%@: Unparseable response:\n%@", self, bodyStr);
-    } else {
-        Warn(@"%@: Response is invalid UTF-8; as CP1252:\n%@", self,
-             [[NSString alloc] initWithData: body encoding: NSWindowsCP1252StringEncoding]);
+        return NO;
     }
-    return NO;
+    
+    // The response at least starts out as what we'd expect, so it looks like the connection was
+    // closed unexpectedly before the full response was sent.
+    NSTimeInterval elapsed = CFAbsoluteTimeGetCurrent() - _startTime;
+    Warn(@"%@: Longpoll connection closed (by proxy?) after %.1f sec", self, elapsed);
+    if (elapsed >= 30.0 && $equal(bodyStr, @"{\"results\":[")) {
+        // Looks like the connection got closed by a proxy (like AWS' load balancer) while the
+        // server was waiting for a change to send, due to lack of activity.
+        // Lower the heartbeat time to work around this, and reconnect:
+        self.heartbeat = MIN(_heartbeat, elapsed * 0.75);
+        [self clearConnection];
+        [self start];       // Next poll...
+    } else {
+        // Response data was truncated. This has been reported as an intermittent error
+        // (see TouchDB issue #241). Treat it as if it were a socket error -- i.e. pause/retry.
+        [self errorOccurred: [NSError errorWithDomain: NSURLErrorDomain
+                                                 code: NSURLErrorNetworkConnectionLost
+                                             userInfo: nil]];
+    }
+    return YES;
 }
 
 
@@ -377,18 +422,12 @@
     Assert(_inputAvailable);
     _inputAvailable = false;
     
-    uint8_t* buffer;
-    NSUInteger bufferLength;
-    NSInteger bytesRead;
-    if ([_trackingInput getBuffer: &buffer length: &bufferLength]) {
-        [_inputBuffer appendBytes: buffer length: bufferLength];
-        bytesRead = bufferLength;
-    } else {
-        uint8_t buffer[kReadLength];
-        bytesRead = [_trackingInput read: buffer maxLength: sizeof(buffer)];
-        if (bytesRead > 0)
-            [_inputBuffer appendBytes: buffer length: bytesRead];
-    }
+    uint8_t buffer[kReadLength];
+    NSInteger bytesRead = [_trackingInput read: buffer maxLength: sizeof(buffer)];
+    if (bytesRead > 0)
+        [_inputBuffer appendBytes: buffer length: bytesRead];
+    else
+        Warn(@"%@: input stream read returned %ld", self, (long)bytesRead); // should never happen
     LogTo(ChangeTracker, @"%@: read %ld bytes", self, (long)bytesRead);
 
     if (_mode == kContinuous)

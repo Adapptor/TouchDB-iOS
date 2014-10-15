@@ -26,10 +26,17 @@ struct StatusMapEntry {
 };
 
 static const struct StatusMapEntry kStatusMap[] = {
-    {kTDStatusNotFound,             404, "not_found"},           // for compatibility with CouchDB
+    // For compatibility with CouchDB, return the same strings it does (see couch_httpd.erl)
+    {kTDStatusBadRequest,           400, "bad_request"},
+    {kTDStatusUnauthorized,         401, "unauthorized"},
+    {kTDStatusNotFound,             404, "not_found"},
+    {kTDStatusForbidden,            403, "forbidden"},
+    {kTDStatusNotAcceptable,        406, "not_acceptable"},
     {kTDStatusConflict,             409, "conflict"},
-    {kTDStatusDuplicate,            412, "Already exists"},      // really 'Precondition Failed'
+    {kTDStatusDuplicate,            412, "file_exists"},      // really 'Precondition Failed'
+    {kTDStatusUnsupportedType,      415, "bad_content_type"},
 
+    // These are nonstandard status codes; map them to closest HTTP equivalents:
     {kTDStatusBadEncoding,          400, "Bad data encoding"},
     {kTDStatusBadAttachment,        400, "Invalid attachment"},
     {kTDStatusAttachmentNotFound,   404, "Attachment not found"},
@@ -61,11 +68,18 @@ int TDStatusToHTTPStatus( TDStatus status, NSString** outMessage ) {
 }
 
 
-NSError* TDStatusToNSError( TDStatus status, NSURL* url ) {
+NSError* TDStatusToNSErrorWithInfo( TDStatus status, NSURL* url, NSDictionary* extraInfo ) {
     NSString* reason;
     status = TDStatusToHTTPStatus(status, &reason);
-    NSDictionary* info = $dict({NSURLErrorKey, url},
+    NSMutableDictionary* info = $mdict({NSURLErrorKey, url},
                                {NSLocalizedFailureReasonErrorKey, reason},
                                {NSLocalizedDescriptionKey, $sprintf(@"%i %@", status, reason)});
-    return [NSError errorWithDomain: TDHTTPErrorDomain code: status userInfo: info];
+    if (extraInfo)
+        [info addEntriesFromDictionary: extraInfo];
+    return [NSError errorWithDomain: TDHTTPErrorDomain code: status userInfo: [info copy]];
+}
+
+
+NSError* TDStatusToNSError( TDStatus status, NSURL* url ) {
+    return TDStatusToNSErrorWithInfo(status, url, nil);
 }

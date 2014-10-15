@@ -26,10 +26,10 @@ extern NSString* TDReplicatorStoppedNotification;
     NSThread* _thread;
     TD_Database* __weak _db;
     NSURL* _remote;
-    TDReachability* _host;
     BOOL _continuous;
     NSString* _filterName;
     NSDictionary* _filterParameters;
+    NSArray* _docIDs;
     NSString* _lastSequence;
     BOOL _lastSequenceChanged;
     NSDictionary* _remoteCheckpoint;
@@ -46,6 +46,11 @@ extern NSString* TDReplicatorStoppedNotification;
     id<TDAuthorizer> _authorizer;
     NSDictionary* _options;
     NSDictionary* _requestHeaders;
+    @private
+    TDReachability* _host;
+    #if TARGET_OS_IPHONE
+            NSUInteger /*UIBackgroundTaskIdentifier*/ _bgTask;
+    #endif
 }
 
 + (NSString *)progressChangedNotification;
@@ -62,6 +67,7 @@ extern NSString* TDReplicatorStoppedNotification;
 @property (readonly) BOOL continuous;
 @property (copy) NSString* filterName;
 @property (copy) NSDictionary* filterParameters;
+@property (copy) NSArray *docIDs;
 @property (copy) NSDictionary* options;
 
 /** Optional dictionary of headers to be added to all requests to remote servers. */
@@ -108,5 +114,9 @@ extern NSString* TDReplicatorStoppedNotification;
 
 /** JSON-compatible array of status info about active remote HTTP requests. */
 @property (readonly) NSArray* activeRequestsStatus;
+
+/** Timeout interval for HTTP requests sent by this replicator.
+    (Derived from options key "connection_timeout", in milliseconds.) */
+@property (readonly) NSTimeInterval requestTimeout;
 
 @end
